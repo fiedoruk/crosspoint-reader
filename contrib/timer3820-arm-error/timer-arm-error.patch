@@ -1,0 +1,247 @@
+diff --git a/lib/hal/HalPowerManager.cpp b/lib/hal/HalPowerManager.cpp
+index 8fbb079..865ce94 100644
+--- a/lib/hal/HalPowerManager.cpp
++++ b/lib/hal/HalPowerManager.cpp
+@@ -5,6 +5,7 @@
+ #include <PowerManager.h>
+ #include <WiFi.h>
+ #include <esp_sleep.h>
++#include <esp_system.h>
+ #include <soc/soc_caps.h>
+ 
+ #include <cassert>
+@@ -75,6 +76,19 @@ void HalPowerManager::setPowerSaving(bool enabled) {
+ }
+ 
+ void HalPowerManager::startDeepSleep(HalGPIO& gpio, uint64_t timerWakeUs) const {
++  if (timerWakeUs > 0) {
++    const auto result = esp_sleep_enable_timer_wakeup(timerWakeUs);
++    if (result != ESP_OK) {
++      LOG_ERR("PWR", "Timer wake arming failed: %d", static_cast<int>(result));
++      const auto disabled = esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
++      if (disabled != ESP_OK && disabled != ESP_ERR_INVALID_STATE) {
++        // Do not sleep with a wake source whose state could not be cleared.
++        LOG_ERR("PWR", "Timer wake disable failed: %d; restarting", static_cast<int>(disabled));
++        esp_restart();
++      }
++    }
++  }
++
+ #if FREEINK_DEVICE_EEGO_A4
+   // LM3630A and GSL share I2C; turn the light off before touch releases the bus.
+   Frontlight.setOn(false);
+@@ -150,12 +164,6 @@ void HalPowerManager::startDeepSleep(HalGPIO& gpio, uint64_t timerWakeUs) const
+   }
+ #endif
+ 
+-  // Add a one-shot timer without changing the board's shutdown or button wake.
+-  // Timer wake requires the ESP to remain powered through sleep.
+-  if (timerWakeUs > 0) {
+-    esp_sleep_enable_timer_wakeup(timerWakeUs);
+-  }
+-
+   // Waits for the power button to be physically released (so holding it doesn't
+   // immediately wake the device again), then arms the wake source and sleeps.
+   freeink::PowerManager::deepSleepUntilPowerButton();
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+index b8b346b..c5ea4a6 100644
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -83,3 +83,4 @@ add_subdirectory(protected_paths)
+ 
+ find_package(Python3 REQUIRED COMPONENTS Interpreter)
+ add_test(NAME TrustedTimeTimezone COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_trusted_time.py)
++add_test(NAME TimerWakeArm COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/timer_wake_arm/run.py)
+diff --git a/test/timer_wake_arm/TimerWakeArmTest.cpp b/test/timer_wake_arm/TimerWakeArmTest.cpp
+new file mode 100644
+index 0000000..b259acd
+--- /dev/null
++++ b/test/timer_wake_arm/TimerWakeArmTest.cpp
+@@ -0,0 +1,134 @@
++// The production sleep function runs against controlled IDF and board boundaries.
++#include <cassert>
++#include <cstdint>
++#include <iostream>
++#include <string>
++#include <vector>
++
++#define ENABLE_SERIAL_LOG
++constexpr int ESP_OK = 0, ESP_ERR_INVALID_STATE = 1, ESP_ERR_INVALID_ARG = 2;
++constexpr int ESP_SLEEP_WAKEUP_TIMER = 4, GPIO_NUM_13 = 13;
++constexpr int GPIO_MODE_OUTPUT = 1, OUTPUT = 1, HIGH = 1;
++using gpio_num_t = int;
++static constexpr gpio_num_t XTEINK_C3_GPIO13 = GPIO_NUM_13;
++static int armResult = ESP_OK, clearResult = ESP_OK, armCalls = 0, clearCalls = 0, batteryCuts = 0;
++static bool timerArmed = false, serialEnded = false;
++static std::vector<int> errors;
++static std::vector<std::string> trace;
++struct Slept {};
++struct Restarted {};
++
++int esp_sleep_enable_timer_wakeup(uint64_t interval) {
++  assert(interval == 60000000);
++  ++armCalls;
++  trace.push_back("arm");
++  if (armResult == ESP_OK) timerArmed = true;
++  return armResult;
++}
++int esp_sleep_disable_wakeup_source(int source) {
++  assert(source == ESP_SLEEP_WAKEUP_TIMER);
++  ++clearCalls;
++  trace.push_back("clear");
++  if (clearResult == ESP_OK || clearResult == ESP_ERR_INVALID_STATE) timerArmed = false;
++  return clearResult;
++}
++[[noreturn]] void esp_restart() {
++  trace.push_back("restart");
++  throw Restarted{};
++}
++void recordError(int code) {
++  assert(!serialEnded);
++  errors.push_back(code);
++  trace.push_back("error");
++}
++#define LOG_ERR(tag, message, code) recordError(code)
++struct Serial {
++  void end() {
++    serialEnded = true;
++    trace.push_back("serial-end");
++  }
++} logSerial;
++struct HalGPIO {
++  bool isXteinkDevice() const { return true; }
++};
++struct HalPowerManager {
++  void startDeepSleep(HalGPIO&, uint64_t = 0) const;
++};
++namespace BoardConfig {
++struct Profile {
++  struct Power {
++    int8_t latch0 = -1, latch1 = -1;
++  } power;
++} ACTIVE;
++}  // namespace BoardConfig
++void gpio_hold_dis(gpio_num_t) {}
++void gpio_set_direction(gpio_num_t, int) {}
++void gpio_set_level(gpio_num_t pin, int value) {
++  assert(pin == 13 && value == 0);
++  ++batteryCuts;
++}
++void gpio_hold_en(gpio_num_t) {}
++void pinMode(int, int) {}
++void digitalWrite(int, int) {}
++namespace freeink {
++struct PowerManager {
++  static void powerDownRailsForSleep() { trace.push_back("rails-down"); }
++  [[noreturn]] static void deepSleepUntilPowerButton() {
++    trace.push_back("sleep");
++    throw Slept{};
++  }
++};
++}  // namespace freeink
++#include "SleepSource.inc"
++
++static void reset() {
++  armResult = clearResult = ESP_OK;
++  armCalls = clearCalls = batteryCuts = 0;
++  timerArmed = serialEnded = false;
++  errors.clear();
++  trace.clear();
++}
++static bool sleep(uint64_t interval) {
++  HalGPIO gpio;
++  try {
++    HalPowerManager{}.startDeepSleep(gpio, interval);
++  } catch (const Slept&) {
++    return true;
++  }
++  return false;
++}
++static bool rejectedRequest() {
++  reset();
++  armResult = ESP_ERR_INVALID_ARG;
++  timerArmed = true;  // A previously configured source must not survive the failed replacement.
++  return sleep(60000000) && armCalls == 1 && clearCalls == 1 && !timerArmed &&
++         errors == std::vector<int>{ESP_ERR_INVALID_ARG} && trace.front() == "arm";
++}
++int main(int argc, char**) {
++  if (argc > 1) return rejectedRequest() ? 0 : 42;
++  reset();
++  assert(sleep(0) && armCalls == 0 && clearCalls == 0 && errors.empty());
++  assert(trace == std::vector<std::string>({"serial-end", "rails-down", "sleep"}));
++  assert(batteryCuts == (SOC_PM_SUPPORT_EXT1_WAKEUP ? 0 : 1));
++  reset();
++  assert(sleep(60000000) && timerArmed && armCalls == 1 && clearCalls == 0 && errors.empty());
++  assert(trace == std::vector<std::string>({"arm", "serial-end", "rails-down", "sleep"}));
++  assert(batteryCuts == (SOC_PM_SUPPORT_EXT1_WAKEUP ? 0 : 1));
++  assert(rejectedRequest());
++  assert(trace == std::vector<std::string>({"arm", "error", "clear", "serial-end", "rails-down", "sleep"}));
++  reset();
++  armResult = ESP_ERR_INVALID_ARG;
++  clearResult = ESP_ERR_INVALID_STATE;
++  assert(sleep(60000000) && !timerArmed && errors.size() == 1 && clearCalls == 1);
++  reset();
++  armResult = ESP_ERR_INVALID_ARG;
++  clearResult = 9;
++  try {
++    sleep(60000000);
++    assert(false);
++  } catch (const Restarted&) {
++  }
++  assert(errors == std::vector<int>({ESP_ERR_INVALID_ARG, 9}));
++  assert(!serialEnded && batteryCuts == 0 && trace.back() == "restart");
++  std::cout << "Timer arm failure/cleanup and zero/EXT1 paths passed\n";
++}
+diff --git a/test/timer_wake_arm/run.py b/test/timer_wake_arm/run.py
+new file mode 100644
+index 0000000..1497757
+--- /dev/null
++++ b/test/timer_wake_arm/run.py
+@@ -0,0 +1,47 @@
++#!/usr/bin/env python3
++"""Exercise the production sleep function with controlled IDF return values."""
++import argparse
++import os
++from pathlib import Path
++import subprocess
++import tempfile
++
++parser = argparse.ArgumentParser(description=__doc__)
++parser.add_argument("--negative-control", action="store_true", help="also check the original PR head rejects the regression test")
++args = parser.parse_args()
++root = Path(__file__).resolve().parents[2]
++here = Path(__file__).resolve().parent
++baseline = "3678609ff49a6a082c5181f1366ebf14038a836c"
++
++
++def function(source):
++    start = source.index("void HalPowerManager::startDeepSleep(")
++    end = source.index("uint16_t HalPowerManager::getBatteryPercentage()", start)
++    return source[start:end]
++
++
++with tempfile.TemporaryDirectory(prefix="timer-wake-arm-") as temporary:
++    temp = Path(temporary)
++    source = (root / "lib/hal/HalPowerManager.cpp").read_text()
++    variants = [("candidate", source)]
++    if args.negative_control:
++        original = subprocess.check_output(
++            ["git", "show", baseline + ":lib/hal/HalPowerManager.cpp"], cwd=root, text=True
++        )
++        variants.append(("original", original))
++    for name, source in variants:
++        (temp / "SleepSource.inc").write_text(function(source))
++        for ext1 in (0, 1):
++            executable = temp / (name + str(ext1))
++            subprocess.run(
++                [os.environ.get("CXX", "c++"), "-std=c++20", "-O0", "-Wall", "-Wextra",
++                 "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
++                 "-DSOC_PM_SUPPORT_EXT1_WAKEUP=" + str(ext1), "-I", str(temp),
++                 str(here / "TimerWakeArmTest.cpp"), "-o", str(executable)], check=True
++            )
++            command = [str(executable)] + (["negative-control"] if name == "original" else [])
++            result = subprocess.run(command)
++            expected = 42 if name == "original" else 0
++            if result.returncode != expected:
++                raise RuntimeError(f"{name}/ext1={ext1}: exit {result.returncode}, expected {expected}")
++            print(f"{name}/ext1={ext1}: expected outcome confirmed")

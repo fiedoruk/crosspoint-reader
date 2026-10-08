@@ -1,0 +1,33 @@
+{
+  "phase": "LOCAL_REVIEWED_SOURCE_CANDIDATE",
+  "base": "3678609ff49a6a082c5181f1366ebf14038a836c",
+  "files": [
+    {
+      "path": "LICENSE-CP",
+      "sha256": "5d025639b5237e35cf93c4ca598ebde40f31f032bf9a9a19fceb3703dca68b84",
+      "bytes": 1087
+    },
+    {
+      "path": "README.md",
+      "sha256": "01685a0058ea32b84e3b01409a53f71ecdaa77a7b52cba327b7c08f02ef82178",
+      "bytes": 3138
+    },
+    {
+      "path": "VALIDATION.en.md",
+      "sha256": "16bb5f7baaecb775b3beea6f15945b40c024d49ef504302aab805143923293eb",
+      "bytes": 1932
+    },
+    {
+      "path": "source-refs.json",
+      "sha256": "ec33bf8d1a6ac479cca4bbfac022cde63f009e2062dce20c952f9535ec16c2f9",
+      "bytes": 519
+    },
+    {
+      "path": "timer-arm-error.patch",
+      "sha256": "dd463c641af1bd305cb28508cf65c5f275084b709005c31b6e1c1670b272eab1",
+      "bytes": 9284
+    }
+  ],
+  "changedCPPaths": 4,
+  "publicationAuthorized": false
+}
