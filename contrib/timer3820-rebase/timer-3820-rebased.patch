@@ -1,0 +1,312 @@
+diff --git a/lib/hal/HalDisplay.cpp b/lib/hal/HalDisplay.cpp
+index 2b3c8c6..495ed11 100644
+--- a/lib/hal/HalDisplay.cpp
++++ b/lib/hal/HalDisplay.cpp
+@@ -28,9 +28,10 @@ void HalDisplay::begin(bool seamless) {
+     return;
+   }
+   // Request resync after specific wakeup events to ensure clean display state.
++  // Timer is a deep-sleep wake like PowerButton: the panel was put to sleep.
+   const auto wakeupReason = gpio.getWakeupReason();
+-  if (wakeupReason == HalGPIO::WakeupReason::PowerButton || wakeupReason == HalGPIO::WakeupReason::AfterFlash ||
+-      wakeupReason == HalGPIO::WakeupReason::Other) {
++  if (wakeupReason == HalGPIO::WakeupReason::PowerButton || wakeupReason == HalGPIO::WakeupReason::Timer ||
++      wakeupReason == HalGPIO::WakeupReason::AfterFlash || wakeupReason == HalGPIO::WakeupReason::Other) {
+     einkDisplay.requestResync();
+   }
+ }
+diff --git a/lib/hal/HalGPIO.cpp b/lib/hal/HalGPIO.cpp
+index 0a4009b..7ce5576 100644
+--- a/lib/hal/HalGPIO.cpp
++++ b/lib/hal/HalGPIO.cpp
+@@ -243,25 +243,18 @@ bool HalGPIO::coldBootImpliesPowerButton() const {
+   return isXteinkDevice() || BoardConfig::isPaperMono() || BoardConfig::isSticky();
+ }
+ 
+-HalGPIO::WakeupReason HalGPIO::getWakeupReason() const {
+-  const auto wakeupCause = esp_sleep_get_wakeup_cause();
+-  const auto resetReason = esp_reset_reason();
+-
+-  const bool usbConnected = isUsbConnected();
++// Guard the wake/reset value pinning in WakeupClassify.h against IDF drift.
++static_assert(ESP_SLEEP_WAKEUP_UNDEFINED == wakeup::WAKEUP_UNDEFINED,
++              "wake-cause values drifted from WakeupClassify.h");
++static_assert(ESP_SLEEP_WAKEUP_EXT1 == wakeup::WAKEUP_EXT1, "wake-cause values drifted from WakeupClassify.h");
++static_assert(ESP_SLEEP_WAKEUP_TIMER == wakeup::WAKEUP_TIMER, "wake-cause values drifted from WakeupClassify.h");
++static_assert(ESP_SLEEP_WAKEUP_GPIO == wakeup::WAKEUP_GPIO, "wake-cause values drifted from WakeupClassify.h");
++static_assert(ESP_RST_UNKNOWN == wakeup::RST_UNKNOWN, "reset-reason values drifted from WakeupClassify.h");
++static_assert(ESP_RST_POWERON == wakeup::RST_POWERON, "reset-reason values drifted from WakeupClassify.h");
++static_assert(ESP_RST_SW == wakeup::RST_SW, "reset-reason values drifted from WakeupClassify.h");
++static_assert(ESP_RST_DEEPSLEEP == wakeup::RST_DEEPSLEEP, "reset-reason values drifted from WakeupClassify.h");
+ 
+-  if (resetReason == ESP_RST_DEEPSLEEP &&
+-      (wakeupCause == ESP_SLEEP_WAKEUP_GPIO || wakeupCause == ESP_SLEEP_WAKEUP_EXT1)) {
+-    return WakeupReason::PowerButton;
+-  }
+-  if (wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED && resetReason == ESP_RST_POWERON && !usbConnected &&
+-      coldBootImpliesPowerButton()) {
+-    return WakeupReason::PowerButton;
+-  }
+-  if (wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED && resetReason == ESP_RST_UNKNOWN && usbConnected) {
+-    return WakeupReason::AfterFlash;
+-  }
+-  if (wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED && resetReason == ESP_RST_POWERON && usbConnected) {
+-    return WakeupReason::AfterUSBPower;
+-  }
+-  return WakeupReason::Other;
++HalGPIO::WakeupReason HalGPIO::getWakeupReason() const {
++  return wakeup::classify(esp_sleep_get_wakeup_cause(), esp_reset_reason(), isUsbConnected(),
++                          coldBootImpliesPowerButton());
+ }
+diff --git a/lib/hal/HalGPIO.h b/lib/hal/HalGPIO.h
+index 226e04b..fe95483 100644
+--- a/lib/hal/HalGPIO.h
++++ b/lib/hal/HalGPIO.h
+@@ -3,6 +3,8 @@
+ #include <Arduino.h>
+ #include <InputManager.h>
+ 
++#include "WakeupClassify.h"
++
+ // Display SPI pins (custom pins for XteinkX4, not hardware SPI defaults)
+ #define EPD_SCLK 8   // SPI Clock
+ #define EPD_MOSI 10  // SPI MOSI (Master Out Slave In)
+@@ -133,7 +135,9 @@ class HalGPIO {
+   // Returns true once per edge (plug or unplug) since the last update()
+   bool wasUsbStateChanged() const;
+ 
+-  enum class WakeupReason { PowerButton, AfterFlash, AfterUSBPower, Other };
++  // Wake classification policy lives in WakeupClassify.h (host-testable);
++  // this alias keeps the historical HalGPIO::WakeupReason name.
++  using WakeupReason = wakeup::Reason;
+ 
+   WakeupReason getWakeupReason() const;
+ 
+diff --git a/lib/hal/HalPowerManager.cpp b/lib/hal/HalPowerManager.cpp
+index 4fba399..8fbb079 100644
+--- a/lib/hal/HalPowerManager.cpp
++++ b/lib/hal/HalPowerManager.cpp
+@@ -74,7 +74,7 @@ void HalPowerManager::setPowerSaving(bool enabled) {
+   xSemaphoreGive(modeMutex);
+ }
+ 
+-void HalPowerManager::startDeepSleep(HalGPIO& gpio) const {
++void HalPowerManager::startDeepSleep(HalGPIO& gpio, uint64_t timerWakeUs) const {
+ #if FREEINK_DEVICE_EEGO_A4
+   // LM3630A and GSL share I2C; turn the light off before touch releases the bus.
+   Frontlight.setOn(false);
+@@ -150,6 +150,12 @@ void HalPowerManager::startDeepSleep(HalGPIO& gpio) const {
+   }
+ #endif
+ 
++  // Add a one-shot timer without changing the board's shutdown or button wake.
++  // Timer wake requires the ESP to remain powered through sleep.
++  if (timerWakeUs > 0) {
++    esp_sleep_enable_timer_wakeup(timerWakeUs);
++  }
++
+   // Waits for the power button to be physically released (so holding it doesn't
+   // immediately wake the device again), then arms the wake source and sleeps.
+   freeink::PowerManager::deepSleepUntilPowerButton();
+diff --git a/lib/hal/HalPowerManager.h b/lib/hal/HalPowerManager.h
+index d2cc99c..bc4138d 100644
+--- a/lib/hal/HalPowerManager.h
++++ b/lib/hal/HalPowerManager.h
+@@ -40,7 +40,11 @@ class HalPowerManager {
+ 
+   // Setup wake up GPIO and enter deep sleep
+   // Should be called inside main loop() to handle the currentLockMode
+-  void startDeepSleep(HalGPIO& gpio) const;
++  //
++  // timerWakeUs requests an ESP-IDF one-shot timer in microseconds; zero adds
++  // no timer. Existing board shutdown and button-wake behavior is unchanged.
++  // Timer wake requires ESP power through sleep and an IDF-accepted duration.
++  void startDeepSleep(HalGPIO& gpio, uint64_t timerWakeUs = 0) const;
+ 
+   // Get battery percentage (range 0-100)
+   uint16_t getBatteryPercentage() const;
+diff --git a/lib/hal/WakeupClassify.h b/lib/hal/WakeupClassify.h
+new file mode 100644
+index 0000000..b74c7fc
+--- /dev/null
++++ b/lib/hal/WakeupClassify.h
+@@ -0,0 +1,64 @@
++#pragma once
++
++#include <cstdint>
++
++// Wake classification for the boot that follows a CrossPoint deep sleep.
++// Pure decision policy, host-testable: the device wrapper
++// (HalGPIO::getWakeupReason) supplies the raw esp_sleep_get_wakeup_cause() /
++// esp_reset_reason() values, the USB-connected probe, and the board's
++// cold-boot power-topology rule.
++namespace wakeup {
++
++enum class Reason : uint8_t {
++  PowerButton,    // Deep-sleep GPIO/ext1 wake (the power button), or a button-
++                  // implied cold boot on button-latched boards
++  Timer,          // Deep-sleep wake armed through the sleep timer
++  AfterFlash,     // Post-flash warm boot over USB
++  AfterUSBPower,  // Cold boot on USB power
++  Other           // Undefined causes, panics, watchdogs, brownouts
++};
++
++// Numeric wake-cause / reset-reason constants pin the stable values of
++// esp_sleep_source_t and esp_reset_reason_t (identical across supported
++// targets; see the framework's esp_sleep.h / esp_system.h). The device
++// wrapper passes its values as ints and guards the pinning with
++// static_asserts, so this policy stays host-compilable.
++inline constexpr int WAKEUP_UNDEFINED = 0;
++inline constexpr int WAKEUP_EXT1 = 3;
++inline constexpr int WAKEUP_TIMER = 4;
++inline constexpr int WAKEUP_GPIO = 7;
++
++inline constexpr int RST_UNKNOWN = 0;
++inline constexpr int RST_POWERON = 1;
++inline constexpr int RST_SW = 3;
++inline constexpr int RST_DEEPSLEEP = 8;
++
++inline Reason classify(const int wakeupCause, const int resetReason, const bool usbConnected,
++                       const bool coldBootImpliesPowerButton) {
++  // Deep-sleep exits carry their wake source in both the reset reason and the
++  // wakeup cause; both must agree, and a USB plug never overrides them.
++  if (resetReason == RST_DEEPSLEEP) {
++    if (wakeupCause == WAKEUP_GPIO || wakeupCause == WAKEUP_EXT1) {
++      return Reason::PowerButton;
++    }
++    if (wakeupCause == WAKEUP_TIMER) {
++      return Reason::Timer;
++    }
++  }
++  // Cold/warm boots: the cause is undefined and only the reset reason and USB
++  // state discriminate.
++  if (wakeupCause == WAKEUP_UNDEFINED) {
++    if (resetReason == RST_POWERON && !usbConnected && coldBootImpliesPowerButton) {
++      return Reason::PowerButton;
++    }
++    if (resetReason == RST_UNKNOWN && usbConnected) {
++      return Reason::AfterFlash;
++    }
++    if (resetReason == RST_POWERON && usbConnected) {
++      return Reason::AfterUSBPower;
++    }
++  }
++  return Reason::Other;
++}
++
++}  // namespace wakeup
+diff --git a/src/main.cpp b/src/main.cpp
+index 7c78c4d..a65abeb 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -544,6 +544,11 @@ void setup() {
+       }
+       wakePowerReleasePending = true;
+       break;
++    case HalGPIO::WakeupReason::Timer:
++      // A timer wake is classified information only: it boots normally like
++      // any non-power-button wake until a consumer is added.
++      LOG_DBG("MAIN", "Wakeup reason: Timer");
++      break;
+     case HalGPIO::WakeupReason::AfterUSBPower:
+       // Most devices return to sleep after a USB-powered cold boot.
+       LOG_DBG("MAIN", "Wakeup reason: After USB Power");
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+index 3287a23..b8b346b 100644
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -66,6 +66,7 @@ add_subdirectory(content_opf_parser)
+ add_subdirectory(chapter_position)
+ add_subdirectory(home_button)
+ add_subdirectory(button_press_navigation)
++add_subdirectory(wakeup_classify)
+ 
+ add_subdirectory(inflate_stream)
+ add_subdirectory(fs_helpers)
+diff --git a/test/wakeup_classify/CMakeLists.txt b/test/wakeup_classify/CMakeLists.txt
+new file mode 100644
+index 0000000..66e117a
+--- /dev/null
++++ b/test/wakeup_classify/CMakeLists.txt
+@@ -0,0 +1,10 @@
++add_executable(WakeupClassifyTest WakeupClassifyTest.cpp)
++
++target_include_directories(WakeupClassifyTest PRIVATE ../../lib/hal)
++
++target_link_libraries(WakeupClassifyTest PRIVATE
++  crosspoint_test_common
++  GTest::gtest_main
++)
++
++gtest_discover_tests(WakeupClassifyTest)
+diff --git a/test/wakeup_classify/WakeupClassifyTest.cpp b/test/wakeup_classify/WakeupClassifyTest.cpp
+new file mode 100644
+index 0000000..0e0c486
+--- /dev/null
++++ b/test/wakeup_classify/WakeupClassifyTest.cpp
+@@ -0,0 +1,65 @@
++#include <gtest/gtest.h>
++
++#include "WakeupClassify.h"
++
++// The classifier and its pinned IDF constants live in lib/hal/WakeupClassify.h;
++// the static_asserts in lib/hal/HalGPIO.cpp verify the pinning against the real
++// esp_sleep.h / esp_system.h values at firmware compile time.
++
++namespace {
++
++using wakeup::classify;
++using W = wakeup::Reason;
++
++constexpr int UNDEF = wakeup::WAKEUP_UNDEFINED;
++constexpr int EXT1 = wakeup::WAKEUP_EXT1;
++constexpr int TIMER = wakeup::WAKEUP_TIMER;
++constexpr int GPIO = wakeup::WAKEUP_GPIO;
++constexpr int RST_UNKNOWN = wakeup::RST_UNKNOWN;
++constexpr int RST_POWERON = wakeup::RST_POWERON;
++constexpr int RST_SW = wakeup::RST_SW;
++constexpr int RST_DEEPSLEEP = wakeup::RST_DEEPSLEEP;
++
++}  // namespace
++
++// 1. A real deep-sleep timer wake classifies as Timer, with or without USB
++// plugged in (the deep-sleep evidence must not be overridden by USB state).
++TEST(WakeupClassify, TimerWakeClassifiesAsTimer) {
++  EXPECT_EQ(classify(TIMER, RST_DEEPSLEEP, false, true), W::Timer);
++  EXPECT_EQ(classify(TIMER, RST_DEEPSLEEP, true, true), W::Timer);
++  EXPECT_EQ(classify(TIMER, RST_DEEPSLEEP, true, false), W::Timer);
++}
++
++// 2. GPIO/ext1 deep-sleep wakes stay PowerButton, USB or not.
++TEST(WakeupClassify, DeepSleepGpioWakeStaysPowerButton) {
++  EXPECT_EQ(classify(GPIO, RST_DEEPSLEEP, false, true), W::PowerButton);
++  EXPECT_EQ(classify(EXT1, RST_DEEPSLEEP, false, true), W::PowerButton);
++  EXPECT_EQ(classify(GPIO, RST_DEEPSLEEP, true, false), W::PowerButton);
++  EXPECT_EQ(classify(EXT1, RST_DEEPSLEEP, true, false), W::PowerButton);
++}
++
++// 3. The timer evidence requires BOTH the deep-sleep reset and the timer wake
++// cause; either half alone is not a timer wake.
++TEST(WakeupClassify, TimerRequiresDeepSleepResetAndCause) {
++  // Sleep-entry abort restarts (RST_SW) and other resets never classify as
++  // Timer, even with a stale cause value.
++  EXPECT_EQ(classify(TIMER, RST_SW, false, true), W::Other);
++  // Deep-sleep exit with an unrecognized cause stays Other.
++  EXPECT_EQ(classify(UNDEF, RST_DEEPSLEEP, false, true), W::Other);
++  // Other wake sources under a deep-sleep reset stay Other, not Timer.
++  EXPECT_EQ(classify(GPIO, RST_DEEPSLEEP, false, false), W::PowerButton);
++}
++
++// 4. Existing cold-boot / USB / flash classifications are unchanged.
++TEST(WakeupClassify, ColdBootTableUnchanged) {
++  // Xteink-style button-latched cold boot without USB = held power button.
++  EXPECT_EQ(classify(UNDEF, RST_POWERON, false, true), W::PowerButton);
++  // Boards without the button-latch topology keep plain cold boots unclassified.
++  EXPECT_EQ(classify(UNDEF, RST_POWERON, false, false), W::Other);
++  // USB cold boot and post-flash warm boot.
++  EXPECT_EQ(classify(UNDEF, RST_POWERON, true, true), W::AfterUSBPower);
++  EXPECT_EQ(classify(UNDEF, RST_UNKNOWN, true, true), W::AfterFlash);
++  // Panics/watchdogs/brownouts and causeless unknown resets stay Other.
++  EXPECT_EQ(classify(UNDEF, RST_UNKNOWN, false, true), W::Other);
++  EXPECT_EQ(classify(UNDEF, RST_SW, false, true), W::Other);
++}

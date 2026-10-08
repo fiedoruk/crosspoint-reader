@@ -1,0 +1,51 @@
+{
+  "classification": "PREPARED_SOURCE_ONLY_NOT_PUBLISHED",
+  "base": "6d2cd3a1c16cb9bdff5a52f6ec657d24f401b0a8",
+  "files": [
+    {
+      "path": "ATTRIBUTION.txt",
+      "bytes": 335,
+      "sha256": "497071902e2ea6eceecc7c3378d147f0100bb245180912fa85bcb2f06c009fbf"
+    },
+    {
+      "path": "HARDWARE.en.md",
+      "bytes": 2184,
+      "sha256": "fb9db24fe86e571608f414e25daf515d49a39cbd4d0f1b61acb577673da596b5"
+    },
+    {
+      "path": "NOTES.en.md",
+      "bytes": 2094,
+      "sha256": "6b9892d7cbe2716d4687db8d8b42520c45767e97e49838d7c248245f0994aa27"
+    },
+    {
+      "path": "README.md",
+      "bytes": 2102,
+      "sha256": "771a644fd6fa844e01cd5bd6e23d399a39dfbcb995c5c61fb8d3aeebca272b37"
+    },
+    {
+      "path": "UPSTREAM-LICENSE.txt",
+      "bytes": 1087,
+      "sha256": "5d025639b5237e35cf93c4ca598ebde40f31f032bf9a9a19fceb3703dca68b84"
+    },
+    {
+      "path": "VALIDATION.en.md",
+      "bytes": 1883,
+      "sha256": "9a9e5a4b588b2a73d10c3cdb0db9bf4d4ce43849800ad06925567b2ad4230a01"
+    },
+    {
+      "path": "source-refs.json",
+      "bytes": 834,
+      "sha256": "d0505319ef315a98fa2512dc333b86eb93cc3aee3a032be463ccdfc94cef7e09"
+    },
+    {
+      "path": "timer-3820-rebased.patch",
+      "bytes": 13503,
+      "sha256": "3488ffdee82ca717e70e53978167864322fd03ecff95874f745a919e165f33b2"
+    },
+    {
+      "path": "verify-classifier.py",
+      "bytes": 2453,
+      "sha256": "3b226395ec58b1a016123ae7a40b25ef0dbf4c64f9db81851582e1dabe4e7a45"
+    }
+  ]
+}

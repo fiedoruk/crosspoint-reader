@@ -1,0 +1,5 @@
+Original timer implementation: Michael Kazakov (@kivarun), PR #3820.
+CrossPoint source copyright and MIT terms: see UPSTREAM-LICENSE.txt.
+Rebase assistance and comparison helper: Copyright (c) 2026 fiedoruk.
+The comparison helper is offered under the same MIT terms.
+AI assistance was used for the adaptation, checks and review notes.

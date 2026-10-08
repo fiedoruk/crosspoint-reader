@@ -1,0 +1,21 @@
+{
+  "upstream": "https://github.com/crosspoint-reader/crosspoint-reader",
+  "base": "6d2cd3a1c16cb9bdff5a52f6ec657d24f401b0a8",
+  "sourcePullRequest": 3820,
+  "originalHead": "46a7e3968c73a918e29a7615191c016fdfcdbf05",
+  "originalAuthor": {
+    "name": "Michael Kazakov",
+    "github": "kivarun",
+    "email": "kivarum@gmail.com"
+  },
+  "sdk": "425d200a8ea447326b4b9696e4e47dc84ad9d7f6",
+  "patchSha256": "3488ffdee82ca717e70e53978167864322fd03ecff95874f745a919e165f33b2",
+  "role": "rebase assistance to existing author; no new PR",
+  "adaptation": [
+    "Keep EEGO A4 frontlight/touch shutdown under new function signature",
+    "Clarify timer power and duration preconditions in two comments",
+    "Repository clang-format wrapper formatting of original additions"
+  ],
+  "device": "NOT_TESTED",
+  "publication": "NOT_PUBLISHED"
+}
