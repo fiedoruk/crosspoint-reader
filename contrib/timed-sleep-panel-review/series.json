@@ -1,0 +1,136 @@
+{
+  "format": 1,
+  "purpose": "Dependent source proposal for review; not an installable SD package or release",
+  "sources": {
+    "crosspoint": {
+      "url": "https://github.com/crosspoint-reader/crosspoint-reader.git",
+      "commit": "43694c9018d26446ab30cce2fa65ee608355ae50"
+    },
+    "sdk": {
+      "url": "https://github.com/Free-Ink/freeink-sdk.git",
+      "commit": "425d200a8ea447326b4b9696e4e47dc84ad9d7f6"
+    },
+    "arduinojson": {
+      "url": "https://github.com/bblanchon/ArduinoJson.git",
+      "commit": "733bc4ee82630c88c0a619a883cd3a206efae977",
+      "version": "7.4.2"
+    }
+  },
+  "patches": [
+    {
+      "file": "patches/01-checked-bmp.diff",
+      "repository": "crosspoint",
+      "sha256": "72827d36842ffc1a56a9d349980b2a91ae246957455c4a079293e342458a45ef",
+      "paths": 8,
+      "provenance": "PR3907 original runtime patch db9a382c; later CI-only e401c84 is irrelevant to this source base"
+    },
+    {
+      "file": "patches/02-bounded-events-after-bmp.diff",
+      "repository": "crosspoint",
+      "sha256": "eb2d8c50af11cfa6f7618a5c834b52bbb6233dab5eb24f141a7d866daeec6e82",
+      "paths": 17,
+      "provenance": "PR3908 f443af33 adapted over PR3907; preserves checked BMP path"
+    },
+    {
+      "file": "patches/03-verified-http-fresh-clock.diff",
+      "repository": "crosspoint",
+      "sha256": "68fcde6b63a6608f6167070b7990756321f86eff51728187781ad76387a4b2f3",
+      "paths": 28,
+      "provenance": "Dependent verified event caller and fresh clock; prepared CP support for SDK65"
+    },
+    {
+      "file": "patches/04-timed-sleep-panel.diff",
+      "repository": "crosspoint",
+      "sha256": "5a40187a8d687e9403cfb9115b7a8eaf53f279a199d71de4395337edb3bf1382",
+      "paths": 35,
+      "provenance": "Timer primitive adapted from PR3820 plus bounded panel lifecycle; dependent proposal"
+    },
+    {
+      "file": "patches/05-sdk65-verification.diff",
+      "repository": "sdk",
+      "sha256": "a97e8a4192949cc8d59289694711a3a9c14bcb7d2b63f6f4461722afd549f35f",
+      "paths": 1,
+      "provenance": "Compatible two-hunk SDK65 support already published under commit cddb06ee5ac6bd39bb577098b11dfbea3b9b7b39"
+    }
+  ],
+  "resultFiles": {
+    "crosspoint": {
+      "docs/plugin-events.md": "8a42cb0ca48c192773ed911041564dbb9d3dafdd8dedceee2d81c4902157e666",
+      "lib/I18n/translations/english.yaml": "f6fccc09071ed34f9d08e74afef1044e2b719ea764d987ac29f43d2dd1789c46",
+      "lib/TrustedTime/TrustedTime.cpp": "e634d8200c25da0b49185b0d86ed39a5419d412735b3fb076a0d480e76185582",
+      "lib/TrustedTime/TrustedTime.h": "1ee00c083aeb923b20efdbb63807838acc05a84a8397309098128cce0e314ff7",
+      "lib/hal/HalDisplay.cpp": "6ec682da5b12455d0a101d2011e979ecac73fc410fe0db3a441bc513ad5844e3",
+      "lib/hal/HalGPIO.cpp": "6d68c88d6785a4676a19b0e2bca15065bee9c6ba6f3cb67639a2abe056bd2c2e",
+      "lib/hal/HalGPIO.h": "06cfbe0fe2bd13cba40d6b41eb0cc61d8a345aec6af50b502b642a2dd42b037c",
+      "lib/hal/HalPowerManager.cpp": "3820e1e0a46daf97f827d4702581d8caf70bc8452a53491023c7b056ee17b2ac",
+      "lib/hal/HalPowerManager.h": "9c6dbe620ee0839c90b548f009cf123b5b2b475f96cabc88b2add2d7e5f8ba7b",
+      "lib/hal/TimerWakeArm.h": "13180a430970649c94580b2285fc7d405f8296b97de97b5929d7ff77686f44e1",
+      "lib/hal/WakeupClassify.h": "9bb69ea01cf2c3bf810c6b5ac80de05ec8805feaccdff5c2f4452524f2eb30ad",
+      "src/activities/plugins/PluginCatalogActivity.cpp": "aa558ab44d50889de98d86903c7c516370557d96fce27d12280952718ca34baa",
+      "src/main.cpp": "9654b83c09825db345e875d9c6c474911fcb5c81488e565f99c3de44a812c14d",
+      "src/util/PluginDrainBudget.h": "1d696736fb81d5228f28e915c42806f2da37ecf44269d8de3da940f59ea0222e",
+      "src/util/PluginEventAsset.cpp": "9bb41e8d5d615fa1a82e0b8fe5c0766f0411f37706619139f8728d04cb2c421d",
+      "src/util/PluginEventAsset.h": "97ebd35c82c4300def95df5e69587088783d51a710c8d58572bd0f6600beae29",
+      "src/util/PluginEventTrust.h": "47703cb085d5ce168b088f135df5fcacf51b46536ae20346250e05ab75e65eca",
+      "src/util/PluginEvents.cpp": "c9f0d77dae9f9b461f780fc6d1305bc52196a92666b555aafb187782cd20dc4e",
+      "src/util/PluginEvents.h": "f2a1e96a49b099429fa6059c970b3c9af88566173f9d013a8ea79803c35c4549",
+      "src/util/PluginHttp.cpp": "8aead4a40e7a5ef0a44298917e0987fb60197c9de1502f27da50fcea1a9f5093",
+      "src/util/PluginHttp.h": "b7ca3a93b5bcb1b9206ae12ec1acdea0366f22e0f746768604c1935511ef7a0b",
+      "src/util/TimedSleepPaint.cpp": "67e450a81203bb8a6704d5b61d917e630fcdcd250412dbacdae22db91f45a7a9",
+      "src/util/TimedSleepPaint.h": "35331c48731065b5135418ce3a69bb31989683eec9af14b1d3c01d310c9fef60",
+      "src/util/TimedWakeGuard.h": "653fe3bf5fea2b9c7443ffd3cbc377b7caf64a768d02b6915cbbf4070357b912",
+      "test/CMakeLists.txt": "43a3d2ea2e664cf29b893e67ff24a8e5ffcc2cb660c55bd4d4b0f2520389e999",
+      "test/plugin_event_asset/AssetTest.cpp": "cf45d591d3b162de8a820da07af42ee9ec8eadf8979f4681d89db53f4cb9d873",
+      "test/plugin_event_asset/run.py": "c3914c90b12ae122bbb2ce8506740a12aeb503fc76be0f1dd3769e2226ce23de",
+      "test/plugin_event_asset/stubs/HalStorage.h": "c78c54d8ffa518e3891499dfe79b07c400dc73960cd4570fa9c223f6c1d77760",
+      "test/plugin_event_asset/stubs/Logging.h": "275b3ddd80e3e2aab3db651e7369dfbe8921a6b6fd1be312a92ecdffc6212f4c",
+      "test/plugin_event_budget/DrainTest.cpp": "9b1eee28fdab809f8e3697da2f4ba04d73940994cc6be86629baf20d367cc535",
+      "test/plugin_event_budget/run.py": "b3d2dc5ed7fc65fa16e1bc4a9f53339d3a378ba79f1d60bdaede849095041def",
+      "test/plugin_event_budget/stubs/Arduino.h": "55341ea798711ee53fed0eb306d5b34ea5a23bb611bc8d577468d99ed6c1c134",
+      "test/plugin_event_budget/stubs/HalStorage.h": "34436fd0b17d7a2083dbd2952bb147a7d8caa1d09dd79051a014e135c73002ee",
+      "test/plugin_event_budget/stubs/Logging.h": "6ca43dbc32a07e1e011418a0797465a05f840102751545c7535b229cf0928f39",
+      "test/plugin_event_budget/stubs/SecureHttpClient.h": "34f2454fa15680f55f324e311a72d959533016413b7d882039d97a43d2afb260",
+      "test/plugin_event_budget/stubs/WString.h": "da46b0008bcfb70909a41eb609f299c8d059ab7df69dc06ba63b11c5cc2d85c1",
+      "test/plugin_event_budget/stubs/components/UITheme.h": "6d720e9d68884133df0516a5c374fb10b48bdd132ee1538521103d2fb4cd8898",
+      "test/plugin_event_budget/stubs/esp_random.h": "568a2c5ab559270d707d39a72b7643fa58ec0317050dc75e0812d93e77b6d751",
+      "test/plugin_event_budget/stubs/network/WifiPowerSaveGuard.h": "2642950636d6e639aae4812fceb89b780349d9ddc9bc4a1debedbdd994305cd1",
+      "test/plugin_verified_http/EventTrustTest.cpp": "debae26f2307ec04aae066fc6180f02927d52d8c53ed58d8d239157f9762bdf2",
+      "test/plugin_verified_http/VerifiedHttpTest.cpp": "7a72a7aa633e108b45895ed111af0eb2d6e1654596996d990af0ebec1f196556",
+      "test/plugin_verified_http/run.py": "0851179eb16998c8bfb2b00ccb823463e16b11c638ad663fdcb1da728d054533",
+      "test/plugin_verified_http/stubs/HalStorage.h": "34436fd0b17d7a2083dbd2952bb147a7d8caa1d09dd79051a014e135c73002ee",
+      "test/plugin_verified_http/stubs/Logging.h": "d139de5c41379e8fd26ce6e1b8790324fa91b786d6f4a9187fc28340742b8d9b",
+      "test/plugin_verified_http/stubs/SecureHttpClient.h": "744140c0980ddfb39d620eba4272071c85112702b3d16bd655fed15281ee09b0",
+      "test/plugin_verified_http/stubs/TrustedTime.h": "fe30f52d1b39d0ed9d8b6fa0a3ec8a70a771941a4f7f81766b56d2c20371c5a5",
+      "test/plugin_verified_http/stubs/WString.h": "da46b0008bcfb70909a41eb609f299c8d059ab7df69dc06ba63b11c5cc2d85c1",
+      "test/plugin_verified_http/stubs/components/UITheme.h": "6d720e9d68884133df0516a5c374fb10b48bdd132ee1538521103d2fb4cd8898",
+      "test/plugin_verified_http/stubs/esp_random.h": "568a2c5ab559270d707d39a72b7643fa58ec0317050dc75e0812d93e77b6d751",
+      "test/plugin_verified_http/stubs/network/WifiPowerSaveGuard.h": "2642950636d6e639aae4812fceb89b780349d9ddc9bc4a1debedbdd994305cd1",
+      "test/timed_sync/BootIoTest.cpp": "b609fe381821649a29240c2d1487b74acf9e661affe0157759daa4353de6f754",
+      "test/timed_sync/PaintTest.cpp": "4ad396dff82ba075bb7e4ec5d2f09a94c5c1d137756d43984ca4f8fb4443df66",
+      "test/timed_sync/TimedSyncTest.cpp": "afe6d890a588eb67d428af36d5146f3e0afd8a1d3cb6f56a71b8ec6cfe82a2f4",
+      "test/timed_sync/run.py": "9daf9dab645ae413df96e8e32e813954bdfe19c4033612f88c1f3133950bf960",
+      "test/timed_sync/stubs/GfxRenderer.h": "a2134f167e7e1c4e48a587cd5aa4aee11a8ec2786f8ac5f0475dac96115e4c41",
+      "test/timed_sync/stubs/HalStorage.h": "a440ef808e26814767cf20ab3b27e87c918dead4477a505299a207d432467c91",
+      "test/timed_sync/stubs/SecureHttpClient.h": "78a44f53c0c0effb6bb0350830942204dea9d4d1b4cd7f99f902cdadc22b4e44",
+      "test/timed_sync/stubs/components/UITheme.h": "dfdaf92fce28c897504404a8ac7a05ac3d0a7987ba4a542ba184eacf7678ca7d",
+      "test/timed_wake_guard/GuardTest.cpp": "fef6ecbf8edf396d01cc5b1a03287769c0b9fbe916909f2208e2a027e500cec7",
+      "test/timed_wake_guard/run.py": "7b0a43d3a4e254dff6fb804788c699b2085a1f27189aa62c7f3f855fcf19626f",
+      "test/timed_wake_guard/stubs/HalGPIO.h": "252064b07907a2919d9bc09f34dc3d068c1d4b50210ef9745650db0a1572beef",
+      "test/timed_wake_guard/stubs/Logging.h": "21d34f43fca49efd4d65d8ce64c8afdba733adad782599e4fbf06166e13559a4",
+      "test/timed_wake_guard/stubs/PowerManager.h": "65e689024dc2389607503ef3e6f1525b735ebbba58aa53138b1bfa67a9cc9fd1",
+      "test/timed_wake_guard/stubs/esp_sleep.h": "5934aee2d57296ca03a9f249365f61ae57b8819a4b3bf4d3151f862d157e01d4",
+      "test/timed_wake_guard/stubs/esp_system.h": "6eb9ddcbdeb265c357a509ab867c6a6eae367168f282eb5f20f4f24f32bc7ebd",
+      "test/trusted_time_fresh/FreshTimeTest.cpp": "fedc844cabb7fe1207ee73afb389116c2ddb62744a186b31595249ab9e1323f4",
+      "test/trusted_time_fresh/run.py": "3862e1df6ab4af8cd52fa4e20723a6bdc369225c4a782ea237743c9a6857333c",
+      "test/trusted_time_fresh/stubs/Arduino.h": "e27948c23be0b873d3a959b1372fc925eb8b2d7df8709e161f875ae9553260ee",
+      "test/trusted_time_fresh/stubs/Logging.h": "318d1c2a965e7158129dd064a6ff97256ff7d22f6f4fa3eeda43ff1379b97f3a",
+      "test/trusted_time_fresh/stubs/Preferences.h": "e2dc64b30424cbace882771013c231a3aef95a84e57b69d9053bd6b85dbca5a1",
+      "test/trusted_time_fresh/stubs/esp_sntp.h": "dfd17dfe54723148de4ebdbf583774001ace7441e0dcc39d7d2e869742f9d61e",
+      "test/wakeup_classify/CMakeLists.txt": "677c2ec27b219ef0516d33de5b0efb3228f6a271513ddd529ccfe643aada8b3f",
+      "test/wakeup_classify/WakeupClassifyTest.cpp": "037c0b27a91d8dddb9798d15f1890f13d46c6d76ca5c35cf1637c6c12452a02d"
+    },
+    "sdk": {
+      "libs/network/SecureNet/src/SecureClient.cpp": "56dfc396ec6d4640033466b3faaa6ce6530a29c47336ea6b651dd5ae0a1536a9"
+    }
+  }
+}

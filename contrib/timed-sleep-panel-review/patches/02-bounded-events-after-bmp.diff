@@ -1,0 +1,849 @@
+diff --git a/docs/plugin-events.md b/docs/plugin-events.md
+index 9397b61e..c2cc848d 100644
+--- a/docs/plugin-events.md
++++ b/docs/plugin-events.md
+@@ -173,18 +173,36 @@ sleep that ends the reading turn.
+ 
+ If WiFi is not already up, the device brings it up for the drain: with battery at
+ least 20% and a saved credential for the last-connected network, it shows a
+-popup, joins with a 10-second deadline, drains, and proceeds to sleep. Sleep is
+-never blocked on the network — a failed join, low battery, or a mid-drain failure
+-just sleeps with the previous image, and the queued events retry on the next
+-drain like any other (at-least-once; a handler whose action only made sense for
+-that particular sleep should tolerate or ignore the late retry, e.g. by checking
+-`{event.ts}`). Other events already queued for the same plugin (`reader.exit` and
+-friends) ride along in the sleep-time drain.
++popup, joins with a 10-second deadline, drains, and proceeds to sleep. Both
++sleep paths use a per-drain budget shared across plugins: four caller HTTP
++operations and a 15-second **cooperative** window measured from the start of
++the drain, after joining.
++A delivery request, password-token mint after 401/403, and its retry consume
++three operations; failed operations count too. SDK-internal connection retries,
++TLS fallback, redirects and handshakes are not counted separately. The existing
++cap of four delivered lines is independent of the operation budget. The web
++server and WiFi-selection drains retain their existing delivered-line limit.
++
++The SDK polls cancellation during HTTP waits and TLS handshakes, but its blocking
++DNS/TCP connect can exceed this window. WiFi join and SD I/O also have no hard
++bound from the drain. These settings do not guarantee wall-clock latency or
++energy use. When the HTTP helper observes cancellation at its checks, it rejects the
++response before file replacement. The elapsed window can still expire after
++the final check, during SD commit. File contents are not validated by this
++budget.
++
++A failed join, low battery or a failed delivery leaves queued events for a later
++drain. Delivery remains at-least-once: a remote effect can precede cancellation
++of its local acknowledgement, so servers should deduplicate by `{event.id}`.
++A handler whose action only made sense for one sleep should tolerate or ignore
++a late retry, for example by checking `{event.ts}`. Plugins keep their scan
++order; earlier backlogs or repeated failures can consume the budget on every
++drain and indefinitely defer later plugins. The budget provides no fairness or
++eventual-delivery guarantee.
+ 
+ Auth reuses the catalog vocabulary from the same `device.json`: `{token}` is
+-read from the declared token file, and on a 401/403 a `"password"`-type auth
+-section mints a fresh token and retries once — same behavior as catalog
+-browsing.
++read from the declared token file. On a 401/403, a `"password"`-type auth section
++mints a fresh token and retries once if the shared budget permits each operation.
+ 
+ ## Substitution variables
+ 
+@@ -253,7 +271,9 @@ belongs on the service's server, keyed by the id in the sidecar.
+ | Request response               | 8KB (discarded)                |
+ | Download                       | 1MB, streamed to SD            |
+ | Subscribed plugins             | 8                              |
+-| Handlers run per drain         | 4 (backlog continues next drain) |
++| Delivered lines per drain      | 4 (remaining lines stay queued) |
++| Sleep drain HTTP operations    | 4, including failed requests, auth mint and retry |
++| Sleep drain elapsed window     | 15 seconds, cooperative; DNS/TCP can exceed it |
+ | Sidecar / config / token files | 2KB each                       |
+ 
+ ## Worked example: hands-free progress sync
+diff --git a/src/main.cpp b/src/main.cpp
+index 7c78c4db..4c96228e 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -281,10 +281,11 @@ static bool loadSleepFrameBuffer() {
+ // now — over the live connection, or by bringing WiFi up when a plugin
+ // subscribes (e.g. fetching a fresh /sleep.bmp so THIS sleep shows it — the
+ // drain runs before goToSleep() renders the sleep screen). The connect path
+-// is bounded (join deadline + drain event budget), skipped on low battery,
+-// and sleep is never blocked on the network: a failed join or delivery just
+-// sleeps with the previous image and the queued events retry on the next
+-// drain (at-least-once). The caller's WiFi shutdown tears the radio down
++// is skipped on low battery. After joining, the drain shares four HTTP
++// operations and a 15-second cooperative deadline; blocking SDK DNS/TCP
++// connect can exceed it. A failed join or delivery keeps the previous image,
++// and queued events retry on the next drain (at-least-once). The caller's
++// WiFi shutdown tears the radio down
+ // either way. Deferrable events already queued (reader.exit) ride along in
+ // the same drain.
+ static void deliverSleepPluginEvents() {
+@@ -307,7 +308,7 @@ static void deliverSleepPluginEvents() {
+   }
+   pluginevents::emit(pluginevents::Event::SleepEnter, vars, varCount);
+   if (WiFi.status() == WL_CONNECTED) {
+-    pluginevents::drain(&renderer);
++    pluginevents::drain(&renderer, 4, {4, 15000});
+     return;
+   }
+   // Any connect-flagged queued event justifies the join, not only
+@@ -327,7 +328,7 @@ static void deliverSleepPluginEvents() {
+   }
+   if (WiFi.status() == WL_CONNECTED) {
+     trustedtime::startSync();  // snap the clock floor while the network is up
+-    pluginevents::drain(&renderer);
++    pluginevents::drain(&renderer, 4, {4, 15000});
+   } else {
+     LOG_DBG("MAIN", "Sleep-event WiFi join timed out; deferring delivery");
+   }
+diff --git a/src/util/PluginDrainBudget.h b/src/util/PluginDrainBudget.h
+new file mode 100644
+index 00000000..f58ae4d0
+--- /dev/null
++++ b/src/util/PluginDrainBudget.h
+@@ -0,0 +1,35 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++
++namespace pluginevents {
++
++// Cooperative limits for one drain, shared by all plugins and by auth/retry.
++// Zero disables each limit independently. The clock is monotonic modulo
++// uint32_t (millis()); elapsed subtraction also works when it wraps.
++// A blocking DNS/TCP connect can exceed maxElapsedMs.
++class DrainBudget {
++ public:
++  using Clock = uint32_t (*)();
++  DrainBudget(size_t attemptLimit, uint32_t elapsedLimit, Clock clockFn)
++      : maxAttempts(attemptLimit), maxElapsedMs(elapsedLimit), clock(clockFn), started(elapsedLimit ? clockFn() : 0) {}
++
++  bool hasDeadline() const { return maxElapsedMs != 0; }
++  bool timeAvailable() const { return !hasDeadline() || static_cast<uint32_t>(clock() - started) < maxElapsedMs; }
++  bool available() const { return (maxAttempts == 0 || attempts < maxAttempts) && timeAvailable(); }
++  bool beginAttempt() {
++    if (!available()) return false;
++    ++attempts;
++    return true;
++  }
++
++ private:
++  size_t maxAttempts;
++  uint32_t maxElapsedMs;
++  Clock clock;
++  uint32_t started;
++  size_t attempts = 0;
++};
++
++}  // namespace pluginevents
+diff --git a/src/util/PluginEvents.cpp b/src/util/PluginEvents.cpp
+index 99d69db9..94a13160 100644
+--- a/src/util/PluginEvents.cpp
++++ b/src/util/PluginEvents.cpp
+@@ -1,5 +1,6 @@
+ #include "PluginEvents.h"
+ 
++#include <Arduino.h>
+ #include <ArduinoJson.h>
+ #include <HalStorage.h>
+ #include <Logging.h>
+@@ -12,6 +13,7 @@
+ #include <vector>
+ 
+ #include "PluginEventAsset.h"
++#include "PluginDrainBudget.h"
+ #include "PluginHttp.h"
+ #include "PluginLocations.h"
+ #include "components/UITheme.h"
+@@ -297,7 +299,7 @@ std::string drainSubstituted(std::string tpl, const std::string& token, const pl
+ // `token` is shared across the drain: a 401-minted refresh persists to the
+ // remaining lines instead of re-minting per line.
+ bool deliverLine(const DrainManifest& mf, const std::string& lineText, std::string& token,
+-                 const pluginhttp::Headers& config, GfxRenderer* renderer) {
++                 const pluginhttp::Headers& config, GfxRenderer* renderer, DrainBudget& budget) {
+   JsonDocument doc;
+   if (deserializeJson(doc, lineText) != DeserializationError::Ok) return true;  // corrupt line: drop
+   const int e = eventFromName(doc["e"] | "");
+@@ -325,6 +327,10 @@ bool deliverLine(const DrainManifest& mf, const std::string& lineText, std::stri
+     for (auto& kv : meta) kv.first = "{meta." + kv.first + "}";
+   }
+ 
++  // The final allowed operation may finish; count exhaustion only blocks starts.
++  const std::function<bool()> shouldAbort = budget.hasDeadline()
++                                                ? std::function<bool()>([&budget] { return !budget.timeAvailable(); })
++                                                : std::function<bool()>{};
+   const auto run = [&](const std::string& tok) {
+     pluginhttp::Headers headers;
+     headers.reserve(handler->req.headers.size());
+@@ -349,10 +355,11 @@ bool deliverLine(const DrainManifest& mf, const std::string& lineText, std::stri
+       // Stream to a sibling temp and swap it in only on a clean 2xx, so a
+       // 404/500 error body can never replace an existing dest (e.g. /sleep.bmp).
+       const std::string tmp = dest + ".part";
++      if (!budget.beginAttempt()) return -1;
+       const int st = pluginhttp::requestToFile(
+           nullptr, drainSubstituted(handler->req.url, tok, config, meta, vars, ts, id), handler->req.method,
+           drainSubstituted(handler->req.body, tok, config, meta, vars, ts, id), headers, tmp.c_str(),
+-          MAX_EVENT_DOWNLOAD);
++          MAX_EVENT_DOWNLOAD, shouldAbort);
+       if (st >= 200 && st < 300) {
+         if (handler->checkedBmp) {
+           // Only a complete 200 BMP may replace the previous image.
+@@ -386,15 +393,17 @@ bool deliverLine(const DrainManifest& mf, const std::string& lineText, std::stri
+       }
+       return st;
+     }
++    if (!budget.beginAttempt()) return -1;
+     String response;
+-    return pluginhttp::request(
+-        nullptr, drainSubstituted(handler->req.url, tok, config, meta, vars, ts, id), handler->req.method,
+-        drainSubstituted(handler->req.body, tok, config, meta, vars, ts, id), headers, response, MAX_EVENT_RESPONSE);
++    return pluginhttp::request(nullptr, drainSubstituted(handler->req.url, tok, config, meta, vars, ts, id),
++                               handler->req.method,
++                               drainSubstituted(handler->req.body, tok, config, meta, vars, ts, id), headers, response,
++                               MAX_EVENT_RESPONSE, nullptr, shouldAbort);
+   };
+ 
+   int status = run(token);
+   // A password-grant token expires; on 401/403 mint a fresh one and retry once.
+-  if ((status == 401 || status == 403) && mf.hasPasswordGrant()) {
++  if ((status == 401 || status == 403) && mf.hasPasswordGrant() && budget.beginAttempt()) {
+     std::string minted;
+     // Same template vocabulary as the delivery request (e.g. a {cfg.*} client
+     // secret in an auth header).
+@@ -406,7 +415,7 @@ bool deliverLine(const DrainManifest& mf, const std::string& lineText, std::stri
+     if (pluginhttp::mintPasswordToken(nullptr, drainSubstituted(mf.authReq.url, token, config, meta, vars, ts, id),
+                                       mf.authReq.method,
+                                       drainSubstituted(mf.authReq.body, token, config, meta, vars, ts, id), authHeaders,
+-                                      mf.authTokenPath, minted)) {
++                                      mf.authTokenPath, minted, shouldAbort)) {
+       pluginhttp::saveTokenToFile(mf.tokenFile, mf.tokenPath, minted);
+       token = minted;
+       status = run(token);
+@@ -422,10 +431,14 @@ bool deliverLine(const DrainManifest& mf, const std::string& lineText, std::stri
+ 
+ }  // namespace
+ 
+-void drain(GfxRenderer* renderer, const size_t maxEvents) {
+-  size_t budget = maxEvents;
++void drain(GfxRenderer* renderer, const size_t maxEvents) { drain(renderer, maxEvents, {0, 0}); }
++
++void drain(GfxRenderer* renderer, const size_t maxEvents, const DrainLimits limits) {
++  size_t remainingEvents = maxEvents;
++  DrainBudget budget(limits.maxAttempts, limits.maxElapsedMs,
++                     []() -> uint32_t { return static_cast<uint32_t>(millis()); });
+   for (const auto& sub : subscribers) {
+-    if (budget == 0) break;
++    if (remainingEvents == 0 || !budget.available()) break;
+     if (sub.name[0] == '\0') continue;
+     const std::string path = outboxPath(sub);
+     if (!Storage.exists(path.c_str())) continue;
+@@ -453,13 +466,13 @@ void drain(GfxRenderer* renderer, const size_t maxEvents) {
+     // Walk lines; stop at the first failure so order is preserved.
+     size_t pos = 0;
+     bool stalled = false;
+-    while (pos < raw.size() && budget > 0 && !stalled) {
++    while (pos < raw.size() && remainingEvents > 0 && budget.available() && !stalled) {
+       size_t nl = raw.find('\n', pos);
+       if (nl == std::string::npos) nl = raw.size();
+       const std::string lineText = raw.substr(pos, nl - pos);
+       if (!lineText.empty()) {
+-        if (deliverLine(mf, lineText, token, config, renderer)) {
+-          budget--;
++        if (deliverLine(mf, lineText, token, config, renderer, budget)) {
++          remainingEvents--;
+         } else {
+           stalled = true;
+           break;
+diff --git a/src/util/PluginEvents.h b/src/util/PluginEvents.h
+index 9f109806..c78d53b7 100644
+--- a/src/util/PluginEvents.h
++++ b/src/util/PluginEvents.h
+@@ -81,13 +81,16 @@ bool wantsConnectAny();
+ // newest events carry the current state; stale ones are worthless by then).
+ void emit(Event e, const Var* vars, size_t varCount);
+ 
+-// Replays queued events through their manifest handlers. Call only while WiFi
+-// is connected; requests run synchronously on the calling task. At most
+-// `maxEvents` handlers run per call (each is a bounded HTTPS request) so a
+-// backlog cannot stall an interactive session. Successfully delivered events
+-// leave the outbox; failures stay for the next drain. When `renderer` is
+-// non-null, a handler's "toast" template is shown via the standard popup after
+-// its request succeeds.
++// Replays queued events synchronously while WiFi is connected. maxEvents caps
++// delivered lines; failures stay queued. Opt-in limits share caller HTTP
++// operations and a cooperative deadline across all plugins, including auth
++// mint and retry. Blocking SDK DNS/TCP connect can exceed the deadline.
++// A non-null renderer shows the handler's toast after a successful request.
++struct DrainLimits {
++  size_t maxAttempts;     // 0 disables the operation count limit
++  uint32_t maxElapsedMs;  // 0 disables the cooperative deadline
++};
+ void drain(GfxRenderer* renderer, size_t maxEvents = 4);
++void drain(GfxRenderer* renderer, size_t maxEvents, DrainLimits limits);
+ 
+ }  // namespace pluginevents
+diff --git a/src/util/PluginHttp.cpp b/src/util/PluginHttp.cpp
+index 34786e08..bd9dd32e 100644
+--- a/src/util/PluginHttp.cpp
++++ b/src/util/PluginHttp.cpp
+@@ -188,10 +188,12 @@ void loadConfigFile(const std::string& file, Headers& out) {
+ int request(freeink::SecureHttpClient* session, const std::string& url, const std::string& method,
+             const std::string& body, const Headers& headers, String& out, const size_t maxResponse,
+             Headers* responseHeaders, const std::function<bool()>& shouldAbort) {
++  if (shouldAbort && shouldAbort()) return -1;
+   WifiPowerSaveGuard psGuard;
+   freeink::SecureHttpClient tmp;
+   freeink::SecureHttpClient* httpPtr = openClient(session, tmp, url, headers);
+   if (!httpPtr) return -1;
++  if (shouldAbort && shouldAbort()) return -1;
+   freeink::SecureHttpClient& http = *httpPtr;
+ 
+   out.remove(0);
+@@ -217,7 +219,7 @@ int request(freeink::SecureHttpClient* session, const std::string& url, const st
+   if (responseHeaders) *responseHeaders = http.getHeaders();
+   // Error statuses still return their body: OAuth device-code polling carries
+   // its state ("authorization_pending") in 4xx response bodies.
+-  if (overflow || status < 0 || !http.responseComplete()) {
++  if (overflow || status < 0 || !http.responseComplete() || (shouldAbort && shouldAbort())) {
+     LOG_ERR("PHTP", "API request failed: status=%d overflow=%d complete=%d %s", status, overflow,
+             http.responseComplete(), url.c_str());
+     return -1;
+@@ -226,11 +228,14 @@ int request(freeink::SecureHttpClient* session, const std::string& url, const st
+ }
+ 
+ int requestToFile(freeink::SecureHttpClient* session, const std::string& url, const std::string& method,
+-                  const std::string& body, const Headers& headers, const char* destPath, const size_t maxResponse) {
++                  const std::string& body, const Headers& headers, const char* destPath, const size_t maxResponse,
++                  const std::function<bool()>& shouldAbort) {
++  if (shouldAbort && shouldAbort()) return -1;
+   WifiPowerSaveGuard psGuard;
+   freeink::SecureHttpClient tmp;
+   freeink::SecureHttpClient* httpPtr = openClient(session, tmp, url, headers);
+   if (!httpPtr) return -1;
++  if (shouldAbort && shouldAbort()) return -1;
+   freeink::SecureHttpClient& http = *httpPtr;
+ 
+   int status = -1;
+@@ -239,23 +244,25 @@ int requestToFile(freeink::SecureHttpClient* session, const std::string& url, co
+   {
+     HalFile file;
+     if (!Storage.openFileForWrite("PHTP", destPath, file)) return -1;
+-    status = http.sendRequest(method.c_str(), reinterpret_cast<const uint8_t*>(body.data()), body.size(),
+-                              [&](const uint8_t* data, size_t len) {
+-                                if (written + len > maxResponse) {
+-                                  writeOk = false;
+-                                  return false;
+-                                }
+-                                if (file.write(data, len) != len) {
+-                                  writeOk = false;
+-                                  return false;
+-                                }
+-                                written += len;
+-                                return true;
+-                              });
++    status = http.sendRequest(
++        method.c_str(), reinterpret_cast<const uint8_t*>(body.data()), body.size(),
++        [&](const uint8_t* data, size_t len) {
++          if (written + len > maxResponse) {
++            writeOk = false;
++            return false;
++          }
++          if (file.write(data, len) != len) {
++            writeOk = false;
++            return false;
++          }
++          written += len;
++          return true;
++        },
++        shouldAbort);
+     file.flush();
+     // file closed at scope exit, before any Storage.remove of destPath
+   }
+-  if (!writeOk || status < 0 || !http.responseComplete()) {
++  if (!writeOk || status < 0 || !http.responseComplete() || (shouldAbort && shouldAbort())) {
+     LOG_ERR("PHTP", "API request (to file) failed: status=%d writeOk=%d complete=%d %s", status, writeOk,
+             http.responseComplete(), url.c_str());
+     Storage.remove(destPath);
+@@ -266,10 +273,10 @@ int requestToFile(freeink::SecureHttpClient* session, const std::string& url, co
+ 
+ bool mintPasswordToken(freeink::SecureHttpClient* session, const std::string& url, const std::string& method,
+                        const std::string& body, const Headers& headers, const std::string& tokenPath,
+-                       std::string& outToken) {
++                       std::string& outToken, const std::function<bool()>& shouldAbort) {
+   String response;
+   constexpr size_t MAX_AUTH_RESPONSE = 8 * 1024;
+-  const int status = request(session, url, method, body, headers, response, MAX_AUTH_RESPONSE);
++  const int status = request(session, url, method, body, headers, response, MAX_AUTH_RESPONSE, nullptr, shouldAbort);
+   if (status < 200 || status >= 300) return false;
+   JsonDocument doc;
+   if (deserializeJson(doc, response) != DeserializationError::Ok) return false;
+diff --git a/src/util/PluginHttp.h b/src/util/PluginHttp.h
+index 747c0d55..c0e04c83 100644
+--- a/src/util/PluginHttp.h
++++ b/src/util/PluginHttp.h
+@@ -86,12 +86,13 @@ int request(freeink::SecureHttpClient* session, const std::string& url, const st
+ 
+ // Same request, body streamed to a file on SD instead of DRAM.
+ int requestToFile(freeink::SecureHttpClient* session, const std::string& url, const std::string& method,
+-                  const std::string& body, const Headers& headers, const char* destPath, size_t maxResponse);
++                  const std::string& body, const Headers& headers, const char* destPath, size_t maxResponse,
++                  const std::function<bool()>& shouldAbort = nullptr);
+ 
+ // Password-grant token mint: runs the (already-substituted) auth request and
+ // extracts the token at `tokenPath` from a 2xx JSON response.
+ bool mintPasswordToken(freeink::SecureHttpClient* session, const std::string& url, const std::string& method,
+                        const std::string& body, const Headers& headers, const std::string& tokenPath,
+-                       std::string& outToken);
++                       std::string& outToken, const std::function<bool()>& shouldAbort = nullptr);
+ 
+ }  // namespace pluginhttp
+diff --git a/test/plugin_event_budget/DrainTest.cpp b/test/plugin_event_budget/DrainTest.cpp
+new file mode 100644
+index 00000000..c3f47110
+--- /dev/null
++++ b/test/plugin_event_budget/DrainTest.cpp
+@@ -0,0 +1,197 @@
++#include <HalStorage.h>
++#include <SecureHttpClient.h>
++
++#include <cassert>
++#include <string>
++#include <vector>
++
++#include "util/PluginEvents.h"
++#include "util/PluginHttp.h"
++#include "util/PluginLocations.h"
++
++uint32_t millis() { return freeink::fakeNow; }
++namespace PluginLocations {
++std::vector<Entry> entries;
++std::vector<Entry> scanPlugins() { return entries; }
++std::string findPluginDir(const char*) { return {}; }
++}  // namespace PluginLocations
++static void setup(const std::vector<std::string>& names, const std::string& manifest, const std::string& outbox) {
++  Storage.files.clear();
++  PluginLocations::entries.clear();
++  freeink::fakeNow = 0;
++  freeink::SecureHttpClient::sends = 0;
++  freeink::SecureHttpClient::sent.clear();
++  freeink::SecureHttpClient::beginDelayMs = 0;
++  freeink::SecureHttpClient::aborted = false;
++  for (const auto& name : names) {
++    const std::string dir = "/plugins/" + name;
++    PluginLocations::entries.push_back({name, dir, false, true, false});
++    Storage.files[dir + "/device.json"] = manifest;
++    Storage.files[dir + "/events.jsonl"] = outbox;
++  }
++  pluginevents::refreshSubscriptions();
++}
++int main() {
++  using freeink::SecureHttpClient;
++  const std::string line = R"({"e":"sleep.enter","id":"stable-1","ts":1,"vars":{}})"
++                           "\n";
++  const std::string second = R"({"e":"sleep.enter","id":"stable-2","ts":2,"vars":{}})"
++                             "\n";
++  const std::string manifest = R"({"events":{"sleep.enter":{"request":{"url":"https://example.test/frame"}}}})";
++  // Failure consumes an attempt; the failed and following lines remain queued.
++  setup({"a", "b"}, manifest, line + line);
++  SecureHttpClient::replies = {{500, "", 1000}, {200, "", 1000}, {200, "", 1000}};
++  pluginevents::drain(nullptr, 4, {3, 5000});
++  assert(SecureHttpClient::sends == 3);
++  assert(Storage.files["/plugins/a/events.jsonl"] == line + line);
++  assert(!Storage.exists("/plugins/b/events.jsonl"));
++
++  // Global three-attempt cap stops later plugins, even with success backlog.
++  setup({"a", "b"}, manifest, line + line + line);
++  SecureHttpClient::replies = {{200, "", 1000}, {200, "", 1000}, {200, "", 1000}, {200, "", 1000}};
++  pluginevents::drain(nullptr, 4, {3, 5000});
++  assert(SecureHttpClient::sends == 3);
++  assert(!Storage.exists("/plugins/a/events.jsonl"));
++  assert(Storage.files["/plugins/b/events.jsonl"] == line + line + line);
++
++  // One 401, one auth mint, one retry use all three slots; later line remains.
++  const std::string grant =
++      R"({"token":{"file":"token.json"},"auth":{"type":"password","request":{"url":"https://example.test/auth"}},"events":{"sleep.enter":{"request":{"url":"https://example.test/frame"}}}})";
++  setup({"a"}, grant, line + second);
++  Storage.files["/plugins/a/token.json"] = R"({"token":"old"})";
++  SecureHttpClient::replies = {
++      {401, "", 1000}, {200, R"({"access_token":"new"})", 1000}, {200, "", 1000}, {200, "", 1000}};
++  pluginevents::drain(nullptr, 4, {3, 5000});
++  assert(SecureHttpClient::sends == 3);
++  assert(Storage.files["/plugins/a/events.jsonl"] == second);
++  assert(Storage.files["/plugins/a/token.json"] == R"({"token":"new"})");
++
++  // Deadline during slow response leaves outbox; no auth or retry starts.
++  setup({"a"}, grant, line);
++  SecureHttpClient::replies = {{401, "", 5000}, {200, "", 0}};
++  pluginevents::drain(nullptr, 4, {3, 5000});
++  assert(SecureHttpClient::sends == 1);
++  assert(Storage.files["/plugins/a/events.jsonl"] == line);
++
++  // Attempt-only opt-in: time=0 does not disable the two-request cap.
++  setup({"a"}, manifest, line + line + line);
++  SecureHttpClient::replies = {{200, "", 1000}, {200, "", 1000}, {200, "", 1000}};
++  pluginevents::drain(nullptr, 4, {2, 0});
++  assert(SecureHttpClient::sends == 2);
++  assert(Storage.files["/plugins/a/events.jsonl"] == line);
++
++  // Deadline-only opt-in: attempts=0 is unlimited until the same clock expires.
++  setup({"a"}, manifest, line + line + line);
++  SecureHttpClient::replies = {{200, "", 2000}, {200, "", 3000}, {200, "", 0}};
++  pluginevents::drain(nullptr, 4, {0, 5000});
++  assert(SecureHttpClient::sends == 2);
++  assert(Storage.files["/plugins/a/events.jsonl"] == line + line);
++
++  // Legacy call has neither limit beyond its original delivered-line cap.
++  setup({"a"}, manifest, line + line + line);
++  SecureHttpClient::replies = {{200, "", 6000}, {200, "", 6000}, {200, "", 6000}};
++  pluginevents::drain(nullptr, 4);
++  assert(SecureHttpClient::sends == 3);
++  assert(!Storage.exists("/plugins/a/events.jsonl"));
++
++  // Successful prefix is removed; failed and later IDs remain in order.
++  setup({"a"}, manifest, line + second + line);
++  SecureHttpClient::replies = {{200, "", 1}, {500, "", 1}};
++  pluginevents::drain(nullptr, 4, {4, 5000});
++  assert(SecureHttpClient::sends == 2);
++  assert(Storage.files["/plugins/a/events.jsonl"] == second + line);
++
++  // Immediate transport failure costs a slot; an untouched later plugin keeps its queue.
++  setup({"a", "b"}, manifest, line + second);
++  SecureHttpClient::replies = {{-1, "", 0}, {200, "", 0}};
++  pluginevents::drain(nullptr, 4, {1, 5000});
++  assert(SecureHttpClient::sends == 1);
++  assert(Storage.files["/plugins/a/events.jsonl"] == line + second);
++  assert(Storage.files["/plugins/b/events.jsonl"] == line + second);
++
++  // A deadline during mint prevents token persistence and a delivery retry.
++  setup({"a"}, grant, line);
++  Storage.files["/plugins/a/token.json"] = R"({"token":"old"})";
++  SecureHttpClient::replies = {{401, "", 1000}, {200, R"({"access_token":"new"})", 4000}, {200, "", 0}};
++  pluginevents::drain(nullptr, 4, {4, 5000});
++  assert(SecureHttpClient::sends == 2 && Storage.files["/plugins/a/events.jsonl"] == line);
++  assert(Storage.files["/plugins/a/token.json"] == R"({"token":"old"})");
++
++  // Auth cannot mint without a slot, nor retry after the mint uses the last one.
++  for (const size_t limit : {1, 2}) {
++    setup({"a"}, grant, line);
++    SecureHttpClient::replies = {{403, "", 1}, {200, R"({"access_token":"new"})", 1}, {200, "", 1}};
++    pluginevents::drain(nullptr, 4, {limit, 5000});
++    assert(SecureHttpClient::sends == limit);
++    assert(Storage.files["/plugins/a/events.jsonl"] == line);
++  }
++
++  // Failure of the mint also consumes its slot; no delivery retry follows.
++  setup({"a"}, grant, line);
++  SecureHttpClient::replies = {{401, "", 1}, {500, "", 1}, {200, "", 1}};
++  pluginevents::drain(nullptr, 4, {4, 5000});
++  assert(SecureHttpClient::sends == 2 && Storage.files["/plugins/a/events.jsonl"] == line);
++
++  // A completed server effect may miss its acknowledgement: replay keeps the ID.
++  const std::string echo =
++      R"({"events":{"sleep.enter":{"request":{"url":"https://example.test/{event.id}","body":"{event.id}"}}}})";
++  setup({"a"}, echo, line);
++  SecureHttpClient::replies = {{200, "", 5000, 0, false}};
++  pluginevents::drain(nullptr, 4, {4, 5000});
++  assert(Storage.files["/plugins/a/events.jsonl"] == line);
++  SecureHttpClient::replies.push_back({200, "", 1});
++  pluginevents::drain(nullptr, 4, {4, 5000});
++  assert(SecureHttpClient::sent.size() == 2);
++  assert(SecureHttpClient::sent[0].url == "https://example.test/stable-1");
++  assert(SecureHttpClient::sent[1].body == SecureHttpClient::sent[0].body);
++  assert(!Storage.exists("/plugins/a/events.jsonl"));
++
++  // Both a mid-response cancel and a late cancel retain bytes and the queued ID.
++  const std::string download =
++      R"({"events":{"sleep.enter":{"download":{"url":"https://example.test/frame","dest":"/frame.dat"}}}})";
++  for (const bool late : {false, true}) {
++    setup({"a"}, download, line);
++    Storage.files["/frame.dat"] = "previous bytes";
++    SecureHttpClient::replies = {{200, "partial replacement", late ? 1U : 5000U, late ? 5000U : 0U, !late}};
++    pluginevents::drain(nullptr, 4, {4, 5000});
++    assert(Storage.files["/frame.dat"] == "previous bytes");
++    assert(!Storage.exists("/frame.dat.part") && !Storage.exists("/frame.dat.bak"));
++    assert(Storage.files["/plugins/a/events.jsonl"] == line);
++  }
++  // Successful download on the last slot keeps the existing generic commit policy.
++  setup({"a"}, download, line);
++  Storage.files["/frame.dat"] = "previous bytes";
++  SecureHttpClient::replies = {{200, "replacement", 1}};
++  pluginevents::drain(nullptr, 4, {1, 5000});
++  assert(Storage.files["/frame.dat"] == "replacement");
++  assert(!Storage.exists("/plugins/a/events.jsonl"));
++
++  // The delivered-line cap is independent of unlimited attempt slots.
++  setup({"a"}, manifest, line + second);
++  SecureHttpClient::replies = {{200, "", 1}, {200, "", 1}};
++  pluginevents::drain(nullptr, 1, {0, 0});
++  assert(SecureHttpClient::sends == 1 && Storage.files["/plugins/a/events.jsonl"] == second);
++
++  // The real drain's uint32_t elapsed calculation survives millis() wrapping.
++  setup({"a"}, manifest, line + second);
++  freeink::fakeNow = UINT32_MAX - 1000;
++  SecureHttpClient::replies = {{200, "", 4000}, {200, "", 1000}};
++  pluginevents::drain(nullptr, 4, {0, 5000});
++  assert(SecureHttpClient::sends == 2 && Storage.files["/plugins/a/events.jsonl"] == second);
++
++  // Cancellation before begin and just after client setup never starts transport.
++  setup({}, manifest, "");
++  String response;
++  const pluginhttp::Headers headers;
++  assert(pluginhttp::request(nullptr, "https://example.test/", "GET", "", headers, response, 1024, nullptr,
++                             [] { return true; }) == -1);
++  assert(pluginhttp::requestToFile(nullptr, "https://example.test/", "GET", "", headers, "/new.part", 1024,
++                                   [] { return true; }) == -1);
++  SecureHttpClient::beginDelayMs = 5000;
++  assert(pluginhttp::request(nullptr, "https://example.test/", "GET", "", headers, response, 1024, nullptr,
++                             [] { return freeink::fakeNow >= 5000; }) == -1);
++  freeink::fakeNow = 0;
++  assert(pluginhttp::requestToFile(nullptr, "https://example.test/", "GET", "", headers, "/new.part", 1024,
++                                   [] { return freeink::fakeNow >= 5000; }) == -1);
++  assert(SecureHttpClient::sends == 0 && !Storage.exists("/new.part"));
++}
+diff --git a/test/plugin_event_budget/run.py b/test/plugin_event_budget/run.py
+new file mode 100644
+index 00000000..970189ed
+--- /dev/null
++++ b/test/plugin_event_budget/run.py
+@@ -0,0 +1,26 @@
++"""Compile production event/HTTP code with deterministic SD, clock and transport stubs."""
++import argparse
++from pathlib import Path
++import subprocess
++import tempfile
++
++root = Path(__file__).resolve().parents[2]
++here = Path(__file__).resolve().parent
++parser = argparse.ArgumentParser(description=__doc__)
++parser.add_argument("--arduinojson", type=Path, default=root / ".pio/libdeps/x4pro/ArduinoJson/src",
++                    help="ArduinoJson 7.4.2 src directory (from the PlatformIO dependency cache)")
++parser.add_argument("--sanitize", action="store_true", help="enable address and undefined-behavior sanitizers")
++args = parser.parse_args()
++if not (args.arduinojson / "ArduinoJson.h").is_file():
++    parser.error("ArduinoJson headers missing; supply --arduinojson with the cached src directory")
++flags = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"] if args.sanitize else []
++with tempfile.TemporaryDirectory(prefix="plugin-event-budget-") as tmp:
++    binary = Path(tmp) / "drain"
++    subprocess.run([
++        "c++", "-std=c++20", "-O0", *flags, "-I", str(here / "stubs"),
++        "-I", str(args.arduinojson), "-I", str(root / "src"),
++        str(root / "src/util/PluginEvents.cpp"), str(root / "src/util/PluginHttp.cpp"),
++        str(here / "DrainTest.cpp"), "-o", str(binary),
++    ], check=True)
++    subprocess.run([str(binary)], check=True)
++print("Plugin event cooperative budget host checks passed")
+diff --git a/test/plugin_event_budget/stubs/Arduino.h b/test/plugin_event_budget/stubs/Arduino.h
+new file mode 100644
+index 00000000..03c52a8a
+--- /dev/null
++++ b/test/plugin_event_budget/stubs/Arduino.h
+@@ -0,0 +1,3 @@
++#pragma once
++#include <cstdint>
++uint32_t millis();
+diff --git a/test/plugin_event_budget/stubs/HalStorage.h b/test/plugin_event_budget/stubs/HalStorage.h
+new file mode 100644
+index 00000000..72d78d5c
+--- /dev/null
++++ b/test/plugin_event_budget/stubs/HalStorage.h
+@@ -0,0 +1,56 @@
++#pragma once
++#include <WString.h>
++#include <fcntl.h>
++
++#include <cstdint>
++#include <string>
++#include <unordered_map>
++struct HalFile {
++  std::string* data = nullptr;
++  bool isOpen() const { return data != nullptr; }
++  explicit operator bool() const { return isOpen(); }
++  size_t write(const char* p, size_t n) {
++    if (!data) return 0;
++    data->append(p, n);
++    return n;
++  }
++  size_t write(const uint8_t* p, size_t n) { return write(reinterpret_cast<const char*>(p), n); }
++  void flush() {}
++  void close() { data = nullptr; }
++  uint64_t fileSize64() const { return data ? data->size() : 0; }
++  size_t fileSize() const { return static_cast<size_t>(fileSize64()); }
++  void truncate(uint64_t n) {
++    if (data) data->resize(n);
++  }
++};
++struct StorageStub {
++  std::unordered_map<std::string, std::string> files;
++  bool readFileToString(const char*, const std::string& path, size_t cap, std::string& out) {
++    const auto it = files.find(path);
++    if (it == files.end() || it->second.size() > cap) return false;
++    out = it->second;
++    return true;
++  }
++  bool openFileForWrite(const char*, const std::string& path, HalFile& f) {
++    files[path].clear();
++    f.data = &files[path];
++    return true;
++  }
++  bool openFileForWrite(const char* t, const char* p, HalFile& f) { return openFileForWrite(t, std::string(p), f); }
++  HalFile open(const char* path, int) { return HalFile{&files[path]}; }
++  bool remove(const char* path) { return files.erase(path) != 0; }
++  bool exists(const char* path) const { return files.find(path) != files.end(); }
++  bool rename(const char* from, const char* to) {
++    auto it = files.find(from);
++    if (it == files.end() || exists(to)) return false;
++    std::string value = std::move(it->second);
++    files.erase(it);
++    files[to] = std::move(value);
++    return true;
++  }
++  bool writeFile(const char* path, const String& value) {
++    files[path] = value.value;
++    return true;
++  }
++};
++inline StorageStub Storage;
+diff --git a/test/plugin_event_budget/stubs/Logging.h b/test/plugin_event_budget/stubs/Logging.h
+new file mode 100644
+index 00000000..85c24a17
+--- /dev/null
++++ b/test/plugin_event_budget/stubs/Logging.h
+@@ -0,0 +1,7 @@
++#pragma once
++#define LOG_ERR(...) \
++  do {               \
++  } while (0)
++#define LOG_DBG(...) \
++  do {               \
++  } while (0)
+diff --git a/test/plugin_event_budget/stubs/SecureHttpClient.h b/test/plugin_event_budget/stubs/SecureHttpClient.h
+new file mode 100644
+index 00000000..cd652950
+--- /dev/null
++++ b/test/plugin_event_budget/stubs/SecureHttpClient.h
+@@ -0,0 +1,62 @@
++#pragma once
++#include <cstdint>
++#include <functional>
++#include <string>
++#include <utility>
++#include <vector>
++namespace freeink {
++inline uint32_t fakeNow = 0;
++class SecureHttpClient {
++ public:
++  using DataCallback = std::function<bool(const uint8_t*, size_t)>;
++  using AbortCallback = std::function<bool()>;
++  struct Reply {
++    int status;
++    std::string body;
++    uint32_t delayMs;
++    uint32_t afterDataMs = 0;
++    bool pollAbort = true;
++  };
++  struct Sent {
++    std::string url, method, body;
++  };
++  static inline std::vector<Reply> replies;
++  static inline std::vector<Sent> sent;
++  static inline size_t sends = 0;
++  static inline uint32_t beginDelayMs = 0;
++  static inline bool aborted = false;
++  void setUserAgent(const char*) {}
++  void setInsecure() {}
++  void setTimeout(uint32_t) {}
++  bool begin(const std::string& value) {
++    url = value;
++    fakeNow += beginDelayMs;
++    return true;
++  }
++  void addHeader(const std::string&, const std::string&) {}
++  int sendRequest(const char* method, const uint8_t* body, size_t len, const DataCallback& onData,
++                  const AbortCallback& shouldAbort = nullptr) {
++    aborted = false;
++    if (sends >= replies.size()) return -1;
++    sent.push_back({url, method, std::string(reinterpret_cast<const char*>(body), len)});
++    const Reply r = replies[sends++];
++    if (r.pollAbort && shouldAbort && shouldAbort()) {
++      aborted = true;
++      return -1;
++    }
++    fakeNow += r.delayMs;
++    if (r.pollAbort && shouldAbort && shouldAbort()) {
++      aborted = true;
++      return -1;
++    }
++    if (!r.body.empty() && !onData(reinterpret_cast<const uint8_t*>(r.body.data()), r.body.size())) return -1;
++    fakeNow += r.afterDataMs;
++    return r.status;
++  }
++  bool responseComplete() const { return !aborted; }
++  std::vector<std::pair<std::string, std::string>> getHeaders() const { return {}; }
++
++ private:
++  std::string url;
++};
++}  // namespace freeink
+diff --git a/test/plugin_event_budget/stubs/WString.h b/test/plugin_event_budget/stubs/WString.h
+new file mode 100644
+index 00000000..3b797bf5
+--- /dev/null
++++ b/test/plugin_event_budget/stubs/WString.h
+@@ -0,0 +1,25 @@
++#pragma once
++#include <string>
++class String {
++ public:
++  String() = default;
++  explicit String(const char* s) : value(s) {}
++  void remove(size_t) { value.clear(); }
++  size_t length() const { return value.size(); }
++  bool reserve(size_t n) {
++    value.reserve(n);
++    return true;
++  }
++  bool concat(const char* p, size_t n) {
++    value.append(p, n);
++    return true;
++  }
++  int read() { return pos < value.size() ? static_cast<unsigned char>(value[pos++]) : -1; }
++  size_t readBytes(char* out, size_t n) {
++    size_t copied = 0;
++    while (copied < n && pos < value.size()) out[copied++] = value[pos++];
++    return copied;
++  }
++  std::string value;
++  size_t pos = 0;
++};
+diff --git a/test/plugin_event_budget/stubs/components/UITheme.h b/test/plugin_event_budget/stubs/components/UITheme.h
+new file mode 100644
+index 00000000..e6749d7b
+--- /dev/null
++++ b/test/plugin_event_budget/stubs/components/UITheme.h
+@@ -0,0 +1,6 @@
++#pragma once
++class GfxRenderer {};
++struct FixtureGUI {
++  void drawPopup(GfxRenderer&, const char*) {}
++};
++inline FixtureGUI GUI;
+diff --git a/test/plugin_event_budget/stubs/esp_random.h b/test/plugin_event_budget/stubs/esp_random.h
+new file mode 100644
+index 00000000..1cc52154
+--- /dev/null
++++ b/test/plugin_event_budget/stubs/esp_random.h
+@@ -0,0 +1,3 @@
++#pragma once
++#include <cstdint>
++inline uint32_t esp_random() { return 123; }
+diff --git a/test/plugin_event_budget/stubs/network/WifiPowerSaveGuard.h b/test/plugin_event_budget/stubs/network/WifiPowerSaveGuard.h
+new file mode 100644
+index 00000000..f6c33673
+--- /dev/null
++++ b/test/plugin_event_budget/stubs/network/WifiPowerSaveGuard.h
+@@ -0,0 +1,2 @@
++#pragma once
++struct WifiPowerSaveGuard {};

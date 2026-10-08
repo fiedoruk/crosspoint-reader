@@ -1,0 +1,1528 @@
+diff --git a/docs/plugin-events.md b/docs/plugin-events.md
+index c2cc848..6b2a17a 100644
+--- a/docs/plugin-events.md
++++ b/docs/plugin-events.md
+@@ -182,6 +182,10 @@ three operations; failed operations count too. SDK-internal connection retries,
+ TLS fallback, redirects and handshakes are not counted separately. The existing
+ cap of four delivered lines is independent of the operation budget. The web
+ server and WiFi-selection drains retain their existing delivered-line limit.
++For a verified event, one lazy SNTP attempt (up to 5 seconds) is shared by
++delivery, password-token minting and retry in that drain. Its wait consumes
++the same cooperative 15-second drain window; the WiFi join has a separate
++window. Verified requests disable redirects explicitly.
+ 
+ The SDK polls cancellation during HTTP waits and TLS handshakes, but its blocking
+ DNS/TCP connect can exceed this window. WiFi join and SD I/O also have no hard
+@@ -286,3 +290,40 @@ saved network for a few seconds, POSTs
+ the compact active-session summary to the plugin's server, shows
+ "Synced", and goes to sleep. Nothing was tapped, no browser was involved, and
+ the firmware contains no mention of the service.
++
++## Opt-in verified HTTPS (dependent proposal)
++
++An event `request` or `download` can declare `"tls": {"ca_file": "certs/root.pem"}`.
++The CA path is relative to that plugin's directory, at most 128 characters;
++absolute paths, parent references, duplicate separators and backslashes are
++rejected. The PEM file is capped at 8KB and must contain a certificate envelope.
++The TLS implementation parses the certificate and verifies the peer.
++
++A present `tls` field opts in even when its value is null, empty or of the wrong
++type. An invalid opt-in fails the request and retains the event; it never falls
++back to insecure HTTP. Verified requests require HTTPS with a nonempty
++authority, a fresh transport and an SNTP callback observed after the current
++drain starts its synchronization attempt. A saved clock floor or an earlier
++SNTP `COMPLETED` status does not qualify. A direct verified HTTP call requires
++the internal callback proof, which expires within 30 seconds under both the
++monotonic and wall clocks. A new failed drain attempt invalidates prior proof.
++SNTP here does not authenticate UTC cryptographically.
++
++Userinfo and query/fragment text within the authority are rejected. Write
++`https://example.test/?token=...`, with a slash before any query; raw control
++characters, NUL and backslashes are rejected. The SDK can log the hostname, so
++never place credentials in a hostname. CP verified failure diagnostics omit the
++substituted URL, headers and body; this is not a guarantee about all SDK debug logs.
++
++If a verified event receives 401/403, password refresh runs only when
++`auth.request` also declares `tls.ca_file`. Both the mint and the retry use their
++own verified transport. Put bearer tokens in headers. Verified failure logs omit
++substituted URLs, headers and bodies. Requests without `tls` retain their existing
++behavior. The catalog's shared legacy session does not support this opt-in and
++rejects manifests that declare `tls` on browse, download or auth requests/polls.
++
++This proposal depends on an SDK implementation that checks CA-load failures and
++matches the peer certificate to the requested hostname. The current SDK pin does
++not provide that contract. `CROSSPOINT_SDK65_VERIFIED_PEER` is a provisional local
++qualification gate; it is disabled by default. A versioned SDK reference or an
++accepted capability must replace this local assumption before merge.
+diff --git a/lib/TrustedTime/TrustedTime.cpp b/lib/TrustedTime/TrustedTime.cpp
+index d6024b7..95e2f4a 100644
+--- a/lib/TrustedTime/TrustedTime.cpp
++++ b/lib/TrustedTime/TrustedTime.cpp
+@@ -27,6 +27,11 @@ constexpr const char* PREFS_KEY = "floor";
+ // well as the main task; 64-bit atomics are not lock-free on the C3.
+ int64_t ramFloor = 0;
+ portMUX_TYPE ramFloorLock = portMUX_INITIALIZER_UNLOCKED;
++uint32_t callbackGeneration = 0;
++int64_t callbackEpoch = 0;
++uint32_t freshAtMs = 0;
++int64_t freshEpoch = 0;
++bool fresh = false;
+ 
+ // Raises the in-RAM floor to `value` if higher; returns the resulting floor.
+ int64_t raiseFloor(const int64_t value) {
+@@ -53,7 +58,14 @@ void writeFloor(const int64_t value) {
+ }
+ 
+ // SNTP sync callback (lwIP task context; Preferences/NVS is mutex-guarded).
+-void onTimeSynced(struct timeval*) { note(); }
++void onTimeSynced(struct timeval*) {
++  const int64_t epoch = static_cast<int64_t>(time(nullptr));
++  portENTER_CRITICAL(&ramFloorLock);
++  callbackEpoch = epoch;
++  ++callbackGeneration;
++  portEXIT_CRITICAL(&ramFloorLock);
++  note();
++}
+ 
+ void configureSntp() {
+   // SNTP uses UTC epochs regardless of the display timezone. Copy TZ before
+@@ -104,6 +116,72 @@ bool syncNow(const uint32_t timeoutMs) {
+   return synced;
+ }
+ 
++bool syncFresh(const uint32_t timeoutMs, const std::function<bool()>& shouldAbort) {
++  uint32_t before;
++  int64_t floor;
++  portENTER_CRITICAL(&ramFloorLock);
++  fresh = false;
++  floor = ramFloor;
++  portEXIT_CRITICAL(&ramFloorLock);
++  // A failed new cycle must not inherit proof from the preceding cycle.
++  if (timeoutMs == 0 || (shouldAbort && shouldAbort())) return false;
++  const int64_t persisted = readFloor();
++  if (persisted > floor) floor = persisted;
++  // configTzTime restarts SNTP while retaining the existing display timezone.
++  configureSntp();
++  // Arm after restart: a callback racing with configTzTime is not proof of
++  // this attempt. Missing that callback fails closed and can retry next cycle.
++  portENTER_CRITICAL(&ramFloorLock);
++  before = callbackGeneration;
++  portEXIT_CRITICAL(&ramFloorLock);
++  const uint32_t started = static_cast<uint32_t>(millis());
++  const uint32_t waitMs = timeoutMs < 5000 ? timeoutMs : 5000;
++  while (true) {
++    if (shouldAbort && shouldAbort()) return false;
++    uint32_t generation;
++    int64_t epoch;
++    portENTER_CRITICAL(&ramFloorLock);
++    generation = callbackGeneration;
++    epoch = callbackEpoch;
++    portEXIT_CRITICAL(&ramFloorLock);
++    if (generation != before) {
++      if (shouldAbort && shouldAbort()) return false;
++      const int64_t now = static_cast<int64_t>(time(nullptr));
++      if (epoch < MIN_VALID_EPOCH || epoch < floor || now < epoch || now < floor) return false;
++      portENTER_CRITICAL(&ramFloorLock);
++      freshEpoch = epoch;
++      freshAtMs = static_cast<uint32_t>(millis());
++      fresh = true;
++      portEXIT_CRITICAL(&ramFloorLock);
++      if (shouldAbort && shouldAbort()) {
++        portENTER_CRITICAL(&ramFloorLock);
++        fresh = false;
++        portEXIT_CRITICAL(&ramFloorLock);
++        return false;
++      }
++      return true;
++    }
++    const uint32_t elapsed = static_cast<uint32_t>(millis()) - started;
++    if (elapsed >= waitMs) return false;
++    delay((waitMs - elapsed) < 50 ? waitMs - elapsed : 50);
++  }
++}
++
++bool hasFreshSync() {
++  uint32_t at;
++  int64_t epoch;
++  int64_t floor;
++  bool valid;
++  portENTER_CRITICAL(&ramFloorLock);
++  at = freshAtMs;
++  epoch = freshEpoch;
++  floor = ramFloor;
++  valid = fresh;
++  portEXIT_CRITICAL(&ramFloorLock);
++  const int64_t now = static_cast<int64_t>(time(nullptr));
++  return valid && static_cast<uint32_t>(millis()) - at < 30000 && now >= epoch && now - epoch < 30 && now >= floor;
++}
++
+ int64_t trustedNow() {
+   const int64_t now = static_cast<int64_t>(time(nullptr));
+   // Never earlier than a time already seen; 0 while neither is trustworthy.
+diff --git a/lib/TrustedTime/TrustedTime.h b/lib/TrustedTime/TrustedTime.h
+index 9740595..bfa9149 100644
+--- a/lib/TrustedTime/TrustedTime.h
++++ b/lib/TrustedTime/TrustedTime.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <cstdint>
++#include <functional>
+ 
+ // A monotonic floor under the system clock, for loan-expiry enforcement.
+ //
+@@ -32,6 +33,16 @@ void startSync();
+ // right now (e.g. progress-sync timestamps). Returns true when synced.
+ bool syncNow(uint32_t timeoutMs);
+ 
++// Require a new SNTP callback for this attempt. A restored floor or a stale
++// global COMPLETED status cannot authorize a verified network request.
++// SNTP itself does not authenticate UTC. Abort is checked before and after
++// the callback and during the bounded wait.
++bool syncFresh(uint32_t timeoutMs, const std::function<bool()>& shouldAbort = nullptr);
++
++// Internal recent-callback proof for verified HTTP; expires after 30 seconds.
++// This is RAM-only and cannot be supplied by a plugin manifest.
++bool hasFreshSync();
++
+ // Epoch seconds when the clock is trustworthy (a plausible present-day
+ // value, restored or synced), else 0. Never earlier than a time already seen
+ // this boot or restored from the floor, so a backward clock step cannot undo
+diff --git a/src/activities/plugins/PluginCatalogActivity.cpp b/src/activities/plugins/PluginCatalogActivity.cpp
+index e5c630b..a96021f 100644
+--- a/src/activities/plugins/PluginCatalogActivity.cpp
++++ b/src/activities/plugins/PluginCatalogActivity.cpp
+@@ -26,6 +26,7 @@
+ #include "network/HttpDownloader.h"
+ #include "network/ProtectedPaths.h"
+ #include "util/BookCacheUtils.h"
++#include "util/PluginEventTrust.h"
+ #include "util/PluginEvents.h"
+ #include "util/PluginHttp.h"
+ #include "util/PluginLocations.h"
+@@ -161,6 +162,7 @@ bool PluginCatalogActivity::loadManifest() {
+   if (!Storage.readFileToString("PCAT", manifestPath, MAX_MANIFEST_SIZE, raw)) return false;
+   JsonDocument doc;
+   if (deserializeJson(doc, raw) != DeserializationError::Ok) return false;
++  if (plugineventtrust::catalogHasTls(doc.as<JsonVariantConst>())) return false;
+ 
+   const std::string pluginDir = manifestPath.substr(0, manifestPath.rfind('/'));
+   manifest.tokenFile = pluginhttp::inPluginDir(pluginDir, doc["token"]["file"] | "");
+diff --git a/src/util/PluginEventTrust.h b/src/util/PluginEventTrust.h
+new file mode 100644
+index 0000000..be96b6e
+--- /dev/null
++++ b/src/util/PluginEventTrust.h
+@@ -0,0 +1,29 @@
++#pragma once
++
++#include <ArduinoJson.h>
++
++#include <string>
++
++namespace plugineventtrust {
++
++// Only the event drain accepts tls.ca_file. A present but malformed value
++// remains opted in, so transport can fail closed instead of using legacy HTTP.
++inline void read(JsonVariantConst req, bool& verified, std::string& caFile) {
++  verified = !req["tls"].isUnbound();
++  caFile.clear();
++  if (verified) {
++    const char* file = req["tls"]["ca_file"].as<const char*>();
++    if (file) caFile = file;
++  }
++}
++
++inline bool mayRefresh(bool eventVerified, bool authVerified) { return !eventVerified || authVerified; }
++
++// The catalog still uses a reusable legacy session. Reject any opt-in on a
++// shared catalog request so it cannot silently send credentials insecurely.
++inline bool catalogHasTls(JsonVariantConst root) {
++  return !root["browse"]["tls"].isUnbound() || !root["download"]["tls"].isUnbound() ||
++         !root["auth"]["request"]["tls"].isUnbound() || !root["auth"]["poll"]["tls"].isUnbound();
++}
++
++}  // namespace plugineventtrust
+diff --git a/src/util/PluginEvents.cpp b/src/util/PluginEvents.cpp
+index 94a1316..6417474 100644
+--- a/src/util/PluginEvents.cpp
++++ b/src/util/PluginEvents.cpp
+@@ -4,6 +4,7 @@
+ #include <ArduinoJson.h>
+ #include <HalStorage.h>
+ #include <Logging.h>
++#include <TrustedTime.h>
+ #include <esp_random.h>
+ #include <time.h>
+ 
+@@ -14,6 +15,7 @@
+ 
+ #include "PluginEventAsset.h"
+ #include "PluginDrainBudget.h"
++#include "PluginEventTrust.h"
+ #include "PluginHttp.h"
+ #include "PluginLocations.h"
+ #include "components/UITheme.h"
+@@ -206,11 +208,15 @@ namespace {
+ struct DrainManifest {
+   std::string tokenFile, tokenPath, configFile;
+   std::string authType, authTokenPath;
++  std::string pluginDir, authCaFile;
++  bool authVerified = false;
+   pluginhttp::RequestSpec authReq;
+   struct Handler {
+     int event = -1;
+     pluginhttp::RequestSpec req;
+     std::string toast;
++    bool verified = false;
++    std::string caFile;
+     // "download" variant: the response streams to `dest` on SD (e.g. a fresh
+     // sleep image) instead of being read as an acknowledgement.
+     std::string dest;
+@@ -237,12 +243,14 @@ bool loadDrainManifest(const Subscriber& sub, DrainManifest& out) {
+   JsonDocument doc;
+   if (deserializeJson(doc, raw, DeserializationOption::Filter(filter)) != DeserializationError::Ok) return false;
+ 
++  out.pluginDir = sub.dir;
+   out.tokenFile = pluginhttp::inPluginDir(sub.dir, doc["token"]["file"] | "");
+   out.tokenPath = doc["token"]["path"] | "token";
+   out.configFile = pluginhttp::inPluginDir(sub.dir, doc["config"]["file"] | "");
+   JsonVariantConst auth = doc["auth"];
+   out.authType = auth["type"] | "device_code";
+   pluginhttp::readRequest(auth["request"], "POST", out.authReq);
++  plugineventtrust::read(auth["request"], out.authVerified, out.authCaFile);
+   out.authTokenPath = auth["token_path"] | "access_token";
+ 
+   out.handlers.reserve(2);
+@@ -254,6 +262,7 @@ bool loadDrainManifest(const Subscriber& sub, DrainManifest& out) {
+     JsonVariantConst dl = kv.value()["download"];
+     if (dl["url"].as<const char*>()) {
+       pluginhttp::readRequest(dl, "GET", h.req);
++      plugineventtrust::read(dl, h.verified, h.caFile);
+       h.dest = dl["dest"] | "";
+       if (!dl["format"].isUnbound()) {
+         const char* format = dl["format"].as<const char*>();
+@@ -266,6 +275,7 @@ bool loadDrainManifest(const Subscriber& sub, DrainManifest& out) {
+       if (h.dest.empty()) continue;  // a download without a destination is meaningless
+     } else {
+       pluginhttp::readRequest(kv.value()["request"], "POST", h.req);
++      plugineventtrust::read(kv.value()["request"], h.verified, h.caFile);
+     }
+     h.toast = kv.value()["toast"] | "";
+     if (!h.req.url.empty()) out.handlers.push_back(std::move(h));
+@@ -299,7 +309,8 @@ std::string drainSubstituted(std::string tpl, const std::string& token, const pl
+ // `token` is shared across the drain: a 401-minted refresh persists to the
+ // remaining lines instead of re-minting per line.
+ bool deliverLine(const DrainManifest& mf, const std::string& lineText, std::string& token,
+-                 const pluginhttp::Headers& config, GfxRenderer* renderer, DrainBudget& budget) {
++                 const pluginhttp::Headers& config, GfxRenderer* renderer, DrainBudget& budget,
++                 bool& clockAttempted, bool& clockReady) {
+   JsonDocument doc;
+   if (deserializeJson(doc, lineText) != DeserializationError::Ok) return true;  // corrupt line: drop
+   const int e = eventFromName(doc["e"] | "");
+@@ -331,6 +342,16 @@ bool deliverLine(const DrainManifest& mf, const std::string& lineText, std::stri
+   const std::function<bool()> shouldAbort = budget.hasDeadline()
+                                                 ? std::function<bool()>([&budget] { return !budget.timeAvailable(); })
+                                                 : std::function<bool()>{};
++  const auto freshFor = [&](bool verified) {
++    if (!verified) return true;
++    if (!clockAttempted) {
++      clockAttempted = true;
++      clockReady = trustedtime::syncFresh(5000, shouldAbort);
++    }
++    return clockReady && trustedtime::hasFreshSync() && (!shouldAbort || !shouldAbort());
++  };
++  const pluginhttp::VerifiedTrust eventTrust{mf.pluginDir, handler->caFile};
++  const pluginhttp::VerifiedTrust* eventTrustPtr = handler->verified ? &eventTrust : nullptr;
+   const auto run = [&](const std::string& tok) {
+     pluginhttp::Headers headers;
+     headers.reserve(handler->req.headers.size());
+@@ -342,7 +363,10 @@ bool deliverLine(const DrainManifest& mf, const std::string& lineText, std::stri
+       // Substituted fields must not climb out of the tree or land on a
+       // credential store (same guard as the catalog sidecar writer).
+       if (!protectedpaths::isPluginPath(dest)) {
+-        LOG_ERR("PEVT", "unsafe download dest rejected: %s", dest.c_str());
++        if (handler->verified)
++          LOG_ERR("PEVT", "Unsafe verified download destination");
++        else
++          LOG_ERR("PEVT", "unsafe download dest rejected: %s", dest.c_str());
+         return 200;  // treat as delivered: retrying can never fix the manifest
+       }
+       if (handler->invalidFormat) return -1;
+@@ -355,11 +379,11 @@ bool deliverLine(const DrainManifest& mf, const std::string& lineText, std::stri
+       // Stream to a sibling temp and swap it in only on a clean 2xx, so a
+       // 404/500 error body can never replace an existing dest (e.g. /sleep.bmp).
+       const std::string tmp = dest + ".part";
+-      if (!budget.beginAttempt()) return -1;
++      if (!freshFor(handler->verified) || !budget.beginAttempt()) return -1;
+       const int st = pluginhttp::requestToFile(
+           nullptr, drainSubstituted(handler->req.url, tok, config, meta, vars, ts, id), handler->req.method,
+           drainSubstituted(handler->req.body, tok, config, meta, vars, ts, id), headers, tmp.c_str(),
+-          MAX_EVENT_DOWNLOAD, shouldAbort);
++          MAX_EVENT_DOWNLOAD, shouldAbort, eventTrustPtr);
+       if (st >= 200 && st < 300) {
+         if (handler->checkedBmp) {
+           // Only a complete 200 BMP may replace the previous image.
+@@ -393,17 +417,19 @@ bool deliverLine(const DrainManifest& mf, const std::string& lineText, std::stri
+       }
+       return st;
+     }
+-    if (!budget.beginAttempt()) return -1;
++    if (!freshFor(handler->verified) || !budget.beginAttempt()) return -1;
+     String response;
+     return pluginhttp::request(nullptr, drainSubstituted(handler->req.url, tok, config, meta, vars, ts, id),
+                                handler->req.method,
+                                drainSubstituted(handler->req.body, tok, config, meta, vars, ts, id), headers, response,
+-                               MAX_EVENT_RESPONSE, nullptr, shouldAbort);
++                               MAX_EVENT_RESPONSE, nullptr, shouldAbort, eventTrustPtr);
+   };
+ 
+   int status = run(token);
+   // A password-grant token expires; on 401/403 mint a fresh one and retry once.
+-  if ((status == 401 || status == 403) && mf.hasPasswordGrant() && budget.beginAttempt()) {
++  if ((status == 401 || status == 403) && mf.hasPasswordGrant() &&
++      plugineventtrust::mayRefresh(handler->verified, mf.authVerified) &&
++      freshFor(mf.authVerified) && budget.beginAttempt()) {
+     std::string minted;
+     // Same template vocabulary as the delivery request (e.g. a {cfg.*} client
+     // secret in an auth header).
+@@ -412,10 +438,12 @@ bool deliverLine(const DrainManifest& mf, const std::string& lineText, std::stri
+     for (const auto& h : mf.authReq.headers) {
+       authHeaders.emplace_back(h.first, drainSubstituted(h.second, token, config, meta, vars, ts, id));
+     }
++    const pluginhttp::VerifiedTrust authTrust{mf.pluginDir, mf.authCaFile};
++    const pluginhttp::VerifiedTrust* authTrustPtr = mf.authVerified ? &authTrust : nullptr;
+     if (pluginhttp::mintPasswordToken(nullptr, drainSubstituted(mf.authReq.url, token, config, meta, vars, ts, id),
+                                       mf.authReq.method,
+                                       drainSubstituted(mf.authReq.body, token, config, meta, vars, ts, id), authHeaders,
+-                                      mf.authTokenPath, minted, shouldAbort)) {
++                                      mf.authTokenPath, minted, shouldAbort, authTrustPtr)) {
+       pluginhttp::saveTokenToFile(mf.tokenFile, mf.tokenPath, minted);
+       token = minted;
+       status = run(token);
+@@ -435,6 +463,8 @@ void drain(GfxRenderer* renderer, const size_t maxEvents) { drain(renderer, maxE
+ 
+ void drain(GfxRenderer* renderer, const size_t maxEvents, const DrainLimits limits) {
+   size_t remainingEvents = maxEvents;
++  bool clockAttempted = false;
++  bool clockReady = false;
+   DrainBudget budget(limits.maxAttempts, limits.maxElapsedMs,
+                      []() -> uint32_t { return static_cast<uint32_t>(millis()); });
+   for (const auto& sub : subscribers) {
+@@ -471,7 +501,7 @@ void drain(GfxRenderer* renderer, const size_t maxEvents, const DrainLimits limi
+       if (nl == std::string::npos) nl = raw.size();
+       const std::string lineText = raw.substr(pos, nl - pos);
+       if (!lineText.empty()) {
+-        if (deliverLine(mf, lineText, token, config, renderer, budget)) {
++        if (deliverLine(mf, lineText, token, config, renderer, budget, clockAttempted, clockReady)) {
+           remainingEvents--;
+         } else {
+           stalled = true;
+diff --git a/src/util/PluginHttp.cpp b/src/util/PluginHttp.cpp
+index bd9dd32..dd5dfe1 100644
+--- a/src/util/PluginHttp.cpp
++++ b/src/util/PluginHttp.cpp
+@@ -3,6 +3,8 @@
+ #include <HalStorage.h>
+ #include <Logging.h>
+ #include <SecureHttpClient.h>
++#include <TrustedTime.h>
++#include <time.h>
+ 
+ #include <algorithm>
+ #include <cctype>
+@@ -15,16 +17,63 @@
+ 
+ namespace {
+ constexpr size_t MAX_TOKEN_FILE_SIZE = 2 * 1024;
++constexpr size_t MAX_CA_FILE_SIZE = 8 * 1024;
++
++bool loadPluginCa(const pluginhttp::VerifiedTrust& trust, std::string& caPem) {
++  // The trust anchor must be a file beneath this plugin, never an absolute
++  // manifest path or another plugin's private file.
++  const std::string& rel = trust.caFile;
++  if (trust.pluginDir.empty() || rel.empty() || rel.size() > 128 || rel.front() == '/' || rel.back() == '/' ||
++      rel.find("..") != std::string::npos || rel.find("//") != std::string::npos || rel.find('\\') != std::string::npos)
++    return false;
++  const std::string path = trust.pluginDir + "/" + rel;
++  if (!protectedpaths::isPluginPath(path)) return false;
++  if (!Storage.readFileToString("PHTP", path, MAX_CA_FILE_SIZE, caPem)) return false;
++  // The SDK parses the PEM; this precheck catches empty/truncated and binary
++  // files before any socket is opened.
++  const size_t begin = caPem.find("-----BEGIN CERTIFICATE-----");
++  const size_t end = caPem.find("-----END CERTIFICATE-----", begin == std::string::npos ? 0 : begin + 27);
++  return caPem.size() >= 64 && caPem.find('\0') == std::string::npos && begin != std::string::npos &&
++         end != std::string::npos;
++}
++
++// The SDK ends the authority only at '/'; query/userinfo must not become a logged host.
++bool validVerifiedUrl(const std::string& url) {
++  if (url.compare(0, 8, "https://") != 0 || url.size() == 8 || url[8] == ':') return false;
++  if (std::any_of(url.begin(), url.end(), [](unsigned char c) { return c <= 0x20 || c == 0x7f || c == '\\'; }))
++    return false;
++  const size_t slash = url.find('/', 8);
++  const size_t authorityEnd = slash == std::string::npos ? url.size() : slash;
++  const size_t forbidden = url.find_first_of("@?#", 8);
++  return authorityEnd > 8 && (forbidden == std::string::npos || forbidden >= authorityEnd);
++}
+ 
+ // Resolves the caller's reused TLS session (or `tmp`) into a configured,
+ // connected client, or nullptr if begin() failed.
+ freeink::SecureHttpClient* openClient(freeink::SecureHttpClient* session, freeink::SecureHttpClient& tmp,
+-                                      const std::string& url, const pluginhttp::Headers& headers) {
++                                      const std::string& url, const pluginhttp::Headers& headers,
++                                      const pluginhttp::VerifiedTrust* trust, std::string& caPem) {
++  if (trust) {
++#ifndef CROSSPOINT_SDK65_VERIFIED_PEER
++    // Provisional LOCAL qualification; this is not an official SDK capability.
++    return nullptr;
++#else
++    // A caller-owned session might already hold an insecure connection. A
++    // verified request always starts with a fresh transport object.
++    if (session || !validVerifiedUrl(url)) return nullptr;
++    const int64_t knownTime = trustedtime::trustedNow();
++    if (!trustedtime::hasFreshSync() || knownTime == 0 || static_cast<int64_t>(time(nullptr)) < knownTime ||
++        !loadPluginCa(*trust, caPem))
++      return nullptr;
++#endif
++  }
+   freeink::SecureHttpClient& http = session ? *session : tmp;
+   http.setUserAgent("CrossPoint");
+-  // Same trust posture as every other SecureNet consumer: no CA bundle ships
+-  // with the transport, so verification is skipped; traffic stays encrypted.
+-  http.setInsecure();
++  if (trust) {
++    http.setFollowRedirects(0);
++    http.setCACert(caPem.c_str());
++  } else
++    http.setInsecure();
+   http.setTimeout(30000);
+   if (!http.begin(url)) return nullptr;
+   for (const auto& h : headers) http.addHeader(h.first, h.second);
+@@ -187,11 +236,12 @@ void loadConfigFile(const std::string& file, Headers& out) {
+ 
+ int request(freeink::SecureHttpClient* session, const std::string& url, const std::string& method,
+             const std::string& body, const Headers& headers, String& out, const size_t maxResponse,
+-            Headers* responseHeaders, const std::function<bool()>& shouldAbort) {
++            Headers* responseHeaders, const std::function<bool()>& shouldAbort, const VerifiedTrust* trust) {
+   if (shouldAbort && shouldAbort()) return -1;
+   WifiPowerSaveGuard psGuard;
++  std::string caPem;
+   freeink::SecureHttpClient tmp;
+-  freeink::SecureHttpClient* httpPtr = openClient(session, tmp, url, headers);
++  freeink::SecureHttpClient* httpPtr = openClient(session, tmp, url, headers, trust, caPem);
+   if (!httpPtr) return -1;
+   if (shouldAbort && shouldAbort()) return -1;
+   freeink::SecureHttpClient& http = *httpPtr;
+@@ -220,8 +270,13 @@ int request(freeink::SecureHttpClient* session, const std::string& url, const st
+   // Error statuses still return their body: OAuth device-code polling carries
+   // its state ("authorization_pending") in 4xx response bodies.
+   if (overflow || status < 0 || !http.responseComplete() || (shouldAbort && shouldAbort())) {
+-    LOG_ERR("PHTP", "API request failed: status=%d overflow=%d complete=%d %s", status, overflow,
+-            http.responseComplete(), url.c_str());
++    if (trust) {
++      LOG_ERR("PHTP", "Verified request failed: status=%d overflow=%d complete=%d", status, overflow,
++              http.responseComplete());
++    } else {
++      LOG_ERR("PHTP", "API request failed: status=%d overflow=%d complete=%d %s", status, overflow,
++              http.responseComplete(), url.c_str());
++    }
+     return -1;
+   }
+   return status;
+@@ -229,11 +284,12 @@ int request(freeink::SecureHttpClient* session, const std::string& url, const st
+ 
+ int requestToFile(freeink::SecureHttpClient* session, const std::string& url, const std::string& method,
+                   const std::string& body, const Headers& headers, const char* destPath, const size_t maxResponse,
+-                  const std::function<bool()>& shouldAbort) {
++                  const std::function<bool()>& shouldAbort, const VerifiedTrust* trust) {
+   if (shouldAbort && shouldAbort()) return -1;
+   WifiPowerSaveGuard psGuard;
++  std::string caPem;
+   freeink::SecureHttpClient tmp;
+-  freeink::SecureHttpClient* httpPtr = openClient(session, tmp, url, headers);
++  freeink::SecureHttpClient* httpPtr = openClient(session, tmp, url, headers, trust, caPem);
+   if (!httpPtr) return -1;
+   if (shouldAbort && shouldAbort()) return -1;
+   freeink::SecureHttpClient& http = *httpPtr;
+@@ -263,8 +319,13 @@ int requestToFile(freeink::SecureHttpClient* session, const std::string& url, co
+     // file closed at scope exit, before any Storage.remove of destPath
+   }
+   if (!writeOk || status < 0 || !http.responseComplete() || (shouldAbort && shouldAbort())) {
+-    LOG_ERR("PHTP", "API request (to file) failed: status=%d writeOk=%d complete=%d %s", status, writeOk,
+-            http.responseComplete(), url.c_str());
++    if (trust) {
++      LOG_ERR("PHTP", "Verified download failed: status=%d writeOk=%d complete=%d", status, writeOk,
++              http.responseComplete());
++    } else {
++      LOG_ERR("PHTP", "API request (to file) failed: status=%d writeOk=%d complete=%d %s", status, writeOk,
++              http.responseComplete(), url.c_str());
++    }
+     Storage.remove(destPath);
+     return -1;
+   }
+@@ -273,10 +334,10 @@ int requestToFile(freeink::SecureHttpClient* session, const std::string& url, co
+ 
+ bool mintPasswordToken(freeink::SecureHttpClient* session, const std::string& url, const std::string& method,
+                        const std::string& body, const Headers& headers, const std::string& tokenPath,
+-                       std::string& outToken, const std::function<bool()>& shouldAbort) {
++                       std::string& outToken, const std::function<bool()>& shouldAbort, const VerifiedTrust* trust) {
+   String response;
+   constexpr size_t MAX_AUTH_RESPONSE = 8 * 1024;
+-  const int status = request(session, url, method, body, headers, response, MAX_AUTH_RESPONSE, nullptr, shouldAbort);
++  const int status = request(session, url, method, body, headers, response, MAX_AUTH_RESPONSE, nullptr, shouldAbort, trust);
+   if (status < 200 || status >= 300) return false;
+   JsonDocument doc;
+   if (deserializeJson(doc, response) != DeserializationError::Ok) return false;
+diff --git a/src/util/PluginHttp.h b/src/util/PluginHttp.h
+index c0e04c8..08e98d0 100644
+--- a/src/util/PluginHttp.h
++++ b/src/util/PluginHttp.h
+@@ -47,6 +47,13 @@ struct RequestSpec {
+   Headers headers;
+ };
+ 
++// Opt-in peer verification requires a qualified SDK implementation.
++// CA contents remain alive for the complete request; caller-owned sessions are rejected.
++struct VerifiedTrust {
++  std::string pluginDir;
++  std::string caFile;
++};
++
+ // Fills `out` from a manifest request node ({url, method, body, headers}).
+ void readRequest(JsonVariantConst node, const char* defaultMethod, RequestSpec& out);
+ 
+@@ -82,17 +89,19 @@ void loadConfigFile(const std::string& file, Headers& out);
+ // duplicates kept. shouldAbort (optional) is polled in every wait loop.
+ int request(freeink::SecureHttpClient* session, const std::string& url, const std::string& method,
+             const std::string& body, const Headers& headers, String& out, size_t maxResponse,
+-            Headers* responseHeaders = nullptr, const std::function<bool()>& shouldAbort = nullptr);
++            Headers* responseHeaders = nullptr, const std::function<bool()>& shouldAbort = nullptr,
++            const VerifiedTrust* trust = nullptr);
+ 
+ // Same request, body streamed to a file on SD instead of DRAM.
+ int requestToFile(freeink::SecureHttpClient* session, const std::string& url, const std::string& method,
+                   const std::string& body, const Headers& headers, const char* destPath, size_t maxResponse,
+-                  const std::function<bool()>& shouldAbort = nullptr);
++                  const std::function<bool()>& shouldAbort = nullptr, const VerifiedTrust* trust = nullptr);
+ 
+ // Password-grant token mint: runs the (already-substituted) auth request and
+ // extracts the token at `tokenPath` from a 2xx JSON response.
+ bool mintPasswordToken(freeink::SecureHttpClient* session, const std::string& url, const std::string& method,
+                        const std::string& body, const Headers& headers, const std::string& tokenPath,
+-                       std::string& outToken, const std::function<bool()>& shouldAbort = nullptr);
++                       std::string& outToken, const std::function<bool()>& shouldAbort = nullptr,
++                       const VerifiedTrust* trust = nullptr);
+ 
+ }  // namespace pluginhttp
+diff --git a/test/plugin_event_budget/run.py b/test/plugin_event_budget/run.py
+index 970189e..62a45bd 100644
+--- a/test/plugin_event_budget/run.py
++++ b/test/plugin_event_budget/run.py
+@@ -18,8 +18,12 @@ with tempfile.TemporaryDirectory(prefix="plugin-event-budget-") as tmp:
+     binary = Path(tmp) / "drain"
+     subprocess.run([
+         "c++", "-std=c++20", "-O0", *flags, "-I", str(here / "stubs"),
++        "-I", str(root / "test/plugin_verified_http/stubs"),
+         "-I", str(args.arduinojson), "-I", str(root / "src"),
++        "-I", str(root / "lib/GfxRenderer"), "-I", str(root / "lib/Memory"),
+         str(root / "src/util/PluginEvents.cpp"), str(root / "src/util/PluginHttp.cpp"),
++        str(root / "src/util/PluginEventAsset.cpp"), str(root / "lib/GfxRenderer/Bitmap.cpp"),
++        str(root / "lib/GfxRenderer/BitmapHelpers.cpp"),
+         str(here / "DrainTest.cpp"), "-o", str(binary),
+     ], check=True)
+     subprocess.run([str(binary)], check=True)
+diff --git a/test/plugin_event_budget/stubs/HalStorage.h b/test/plugin_event_budget/stubs/HalStorage.h
+index 72d78d5..4723011 100644
+--- a/test/plugin_event_budget/stubs/HalStorage.h
++++ b/test/plugin_event_budget/stubs/HalStorage.h
+@@ -7,6 +7,7 @@
+ #include <unordered_map>
+ struct HalFile {
+   std::string* data = nullptr;
++  size_t pos = 0;
+   bool isOpen() const { return data != nullptr; }
+   explicit operator bool() const { return isOpen(); }
+   size_t write(const char* p, size_t n) {
+@@ -19,6 +20,26 @@ struct HalFile {
+   void close() { data = nullptr; }
+   uint64_t fileSize64() const { return data ? data->size() : 0; }
+   size_t fileSize() const { return static_cast<size_t>(fileSize64()); }
++  bool seek(uint64_t offset) {
++    if (!data || offset > data->size()) return false;
++    pos = static_cast<size_t>(offset);
++    return true;
++  }
++  bool seekCur(int64_t offset) {
++    if (offset < 0 && static_cast<uint64_t>(-offset) > pos) return false;
++    return seek(pos + offset);
++  }
++  int read() { return !data || pos >= data->size() ? -1 : static_cast<unsigned char>((*data)[pos++]); }
++  size_t read(void* out, size_t count) {
++    auto* bytes = static_cast<unsigned char*>(out);
++    size_t n = 0;
++    while (n < count) {
++      const int c = read();
++      if (c < 0) break;
++      bytes[n++] = static_cast<unsigned char>(c);
++    }
++    return n;
++  }
+   void truncate(uint64_t n) {
+     if (data) data->resize(n);
+   }
+@@ -37,6 +58,13 @@ struct StorageStub {
+     return true;
+   }
+   bool openFileForWrite(const char* t, const char* p, HalFile& f) { return openFileForWrite(t, std::string(p), f); }
++  bool openFileForRead(const char*, const std::string& path, HalFile& f) {
++    const auto it = files.find(path);
++    if (it == files.end()) return false;
++    f.data = &it->second;
++    f.pos = 0;
++    return true;
++  }
+   HalFile open(const char* path, int) { return HalFile{&files[path]}; }
+   bool remove(const char* path) { return files.erase(path) != 0; }
+   bool exists(const char* path) const { return files.find(path) != files.end(); }
+diff --git a/test/plugin_event_budget/stubs/SecureHttpClient.h b/test/plugin_event_budget/stubs/SecureHttpClient.h
+index cd65295..6107bff 100644
+--- a/test/plugin_event_budget/stubs/SecureHttpClient.h
++++ b/test/plugin_event_budget/stubs/SecureHttpClient.h
+@@ -27,6 +27,8 @@ class SecureHttpClient {
+   static inline bool aborted = false;
+   void setUserAgent(const char*) {}
+   void setInsecure() {}
++  void setCACert(const char*) {}
++  void setFollowRedirects(int) {}
+   void setTimeout(uint32_t) {}
+   bool begin(const std::string& value) {
+     url = value;
+diff --git a/test/plugin_verified_http/EventTrustTest.cpp b/test/plugin_verified_http/EventTrustTest.cpp
+new file mode 100644
+index 0000000..89cd9ab
+--- /dev/null
++++ b/test/plugin_verified_http/EventTrustTest.cpp
+@@ -0,0 +1,177 @@
++#include <HalStorage.h>
++#include <Logging.h>
++#include <SecureHttpClient.h>
++#include <TrustedTime.h>
++
++#include <cassert>
++#include <string>
++#include <vector>
++
++#include "util/PluginEvents.h"
++#include "util/PluginLocations.h"
++
++namespace PluginLocations {
++std::vector<Entry> entries;
++std::vector<Entry> scanPlugins() { return entries; }
++std::string findPluginDir(const char*) { return {}; }
++}  // namespace PluginLocations
++
++using Http = freeink::SecureHttpClient;
++uint32_t millis() { return trustedtime::fixtureMs; }
++static const std::string LINE = "{\"e\":\"sleep.enter\",\"id\":\"fixture-id\",\"ts\":1,\"vars\":{}}\n";
++static const std::string PEM = "-----BEGIN CERTIFICATE-----\n" + std::string(80, 'A') + "\n-----END CERTIFICATE-----\n";
++static std::string bmp(char color) {
++  std::string s(70, '\0');
++  for (size_t i = 54; i < s.size(); ++i) s[i] = color;
++  const auto le16 = [&](size_t at, uint16_t value) {
++    s[at] = static_cast<char>(value);
++    s[at + 1] = static_cast<char>(value >> 8);
++  };
++  const auto le32 = [&](size_t at, uint32_t value) {
++    for (size_t i = 0; i < 4; ++i) s[at + i] = static_cast<char>(value >> (i * 8));
++  };
++  le16(0, 0x4d42);
++  le32(2, 70);
++  le32(10, 54);
++  le32(14, 40);
++  le32(18, 2);
++  le32(22, 2);
++  le16(26, 1);
++  le16(28, 24);
++  le32(34, 16);
++  return s;
++}
++static void setup(const std::string& event, const std::string& auth = "") {
++  Storage.files.clear();
++  PluginLocations::entries = {{"test", "/plugins/test", false, true, false}};
++  Storage.files["/plugins/test/device.json"] =
++      "{\"token\":{\"file\":\"token.json\"}," + auth + "\"events\":{\"sleep.enter\":{" + event + "}}}";
++  Storage.files["/plugins/test/events.jsonl"] = LINE;
++  Storage.files["/plugins/test/token.json"] = "{\"token\":\"sentinel-query\"}";
++  Storage.files["/plugins/test/root.pem"] = PEM;
++  Http::begins = Http::sends = Http::insecureCalls = Http::caCalls = 0;
++  Http::replies.clear();
++  Http::urls.clear();
++  Http::headers.clear();
++  Http::bodies.clear();
++  Http::reply.clear();
++  Http::status = 200;
++  Http::complete = true;
++  Http::sendDelayMs = 0;
++  Http::abortAfterBody = false;
++  trustedtime::now = 1800000000;
++  trustedtime::fresh = false;
++  trustedtime::syncSucceeds = true;
++  trustedtime::syncAttempts = 0;
++  trustedtime::fixtureMs = 0;
++  trustedtime::syncDelayMs = 0;
++  fixturelog::output.clear();
++  pluginevents::refreshSubscriptions();
++}
++static bool queued() { return Storage.exists("/plugins/test/events.jsonl"); }
++int main() {
++  const std::string request =
++      R"("request":{"url":"https://example.test/frame?token={token}","headers":{"Authorization":"Bearer {token}"},"tls":{"ca_file":"root.pem"}})";
++  const std::string auth =
++      R"("auth":{"type":"password","request":{"url":"https://example.test/auth","tls":{"ca_file":"root.pem"}},"token_path":"access_token"},)";
++  setup(request);
++  pluginevents::drain(nullptr);
++#ifdef CROSSPOINT_SDK65_VERIFIED_PEER
++  assert(Http::sends == 1 && Http::caCalls == 1 && Http::insecureCalls == 0 && !queued());
++  assert(trustedtime::syncAttempts == 1);
++  assert(Http::headers[0] == "Authorization:Bearer sentinel-query");
++  setup(request);
++  Storage.files["/plugins/test/events.jsonl"] += LINE;
++  trustedtime::syncSucceeds = false;
++  pluginevents::drain(nullptr);
++  assert(Http::sends == 0 && trustedtime::syncAttempts == 1 && queued());
++  setup(request);
++  trustedtime::syncDelayMs = 15000;
++  pluginevents::drain(nullptr, 4, {4, 15000});
++  assert(Http::sends == 0 && trustedtime::syncAttempts == 1 && queued());
++  setup(request, auth);
++  Http::replies = {{401, ""}, {200, R"({"access_token":"fixture-new"})"}, {200, ""}};
++  Http::sendDelayMs = 1000;
++  pluginevents::drain(nullptr, 4, {3, 15000});
++  assert(Http::sends == 3 && Http::caCalls == 3 && Http::insecureCalls == 0 && !queued());
++  assert(trustedtime::syncAttempts == 1);
++  assert(Http::urls.back() == "https://example.test/frame?token=fixture-new");
++  assert(Storage.files["/plugins/test/token.json"].find("fixture-new") != std::string::npos);
++  setup(request, auth);
++  Http::replies = {{403, ""}, {200, R"({"access_token":"fixture-new"})"}, {403, ""}};
++  pluginevents::drain(nullptr, 4, {3, 15000});
++  assert(Http::sends == 3 && queued() && trustedtime::syncAttempts == 1);
++  setup(request, auth);
++  Http::replies = {{401, ""}, {200, R"({"access_token":"fixture-new"})"}, {200, ""}};
++  Http::sendDelayMs = 7500;
++  pluginevents::drain(nullptr, 4, {3, 15000});
++  assert(Http::sends == 2 && queued() && trustedtime::syncAttempts == 1);
++  setup(request, R"("auth":{"type":"password","request":{"url":"https://example.test/auth"}},)");
++  Http::replies = {{401, ""}, {200, R"({"access_token":"must-not-mint"})"}};
++  pluginevents::drain(nullptr);
++  assert(Http::sends == 1 && Http::caCalls == 1 && Http::insecureCalls == 0 && queued());
++  setup(request, auth);
++  Http::replies = {{401, ""}, {-1, "", false}};
++  pluginevents::drain(nullptr);
++  assert(Http::sends == 2 && Http::insecureCalls == 0 && queued());
++  assert(fixturelog::output.find("sentinel") == std::string::npos);
++  setup(request);
++  Http::replies = {{-1, "sentinel-body", false}};
++  pluginevents::drain(nullptr);
++  assert(queued() && Http::sends == 1 && Http::insecureCalls == 0);
++  assert(fixturelog::output.find("sentinel") == std::string::npos);
++  for (const std::string& invalid :
++       {"null", "42", "\"ignored\"", "{}", "{\"ca_file\":null}", "{\"ca_file\":42}", "{\"ca_file\":\"\"}"}) {
++    setup("\"request\":{\"url\":\"https://example.test/frame\",\"tls\":" + invalid + "}");
++    pluginevents::drain(nullptr);
++    assert(Http::begins == 0 && Http::sends == 0 && Http::insecureCalls == 0 && queued());
++  }
++  const std::string download =
++      R"("download":{"url":"https://example.test/frame?token={token}","dest":"/plugins/test/frame.bin","tls":{"ca_file":"root.pem"}})";
++  setup(download);
++  Storage.files["/plugins/test/frame.bin"] = "current";
++  Http::replies = {{500, "error-body"}};
++  pluginevents::drain(nullptr);
++  assert(queued() && Storage.files["/plugins/test/frame.bin"] == "current");
++  assert(!Storage.exists("/plugins/test/frame.bin.part"));
++  setup(download);
++  Storage.files["/plugins/test/frame.bin"] = "current";
++  Http::replies = {{200, "replacement"}};
++  pluginevents::drain(nullptr);
++  assert(!queued() && Storage.files["/plugins/test/frame.bin"] == "replacement");
++  assert(!Storage.exists("/plugins/test/frame.bin.part") && !Storage.exists("/plugins/test/frame.bin.bak"));
++  const std::string checked =
++      R"("download":{"url":"https://example.test/frame","dest":"/plugins/test/frame.bmp","format":"bmp","width":2,"height":2,"tls":{"ca_file":"root.pem"}})";
++  setup(checked);
++  Storage.files["/plugins/test/frame.bmp"] = bmp(1);
++  Http::replies = {{200, bmp(2)}};
++  pluginevents::drain(nullptr, 4, {4, 15000});
++  assert(!queued() && Storage.files["/plugins/test/frame.bmp"] == bmp(2));
++  setup(checked);
++  Storage.files["/plugins/test/frame.bmp"] = bmp(1);
++  Http::replies = {{200, "bad bmp"}};
++  pluginevents::drain(nullptr, 4, {4, 15000});
++  assert(queued() && Storage.files["/plugins/test/frame.bmp"] == bmp(1));
++  for (const int status : {302, 304}) {
++    setup(checked);
++    Storage.files["/plugins/test/frame.bmp"] = bmp(1);
++    Http::replies = {{status, "redirect-or-cache"}};
++    pluginevents::drain(nullptr, 4, {4, 15000});
++    assert(queued() && Storage.files["/plugins/test/frame.bmp"] == bmp(1));
++    assert(!Storage.exists("/plugins/test/frame.bmp.part"));
++  }
++  setup(checked);
++  Storage.files["/plugins/test/frame.bmp"] = bmp(1);
++  Http::replies = {{200, bmp(2)}};
++  Http::sendDelayMs = 15000;
++  Http::abortAfterBody = true;
++  pluginevents::drain(nullptr, 4, {4, 15000});
++  assert(queued() && Storage.files["/plugins/test/frame.bmp"] == bmp(1));
++  assert(!Storage.exists("/plugins/test/frame.bmp.part"));
++#else
++  assert(Http::begins == 0 && Http::sends == 0 && Http::insecureCalls == 0 && queued());
++#endif
++  setup(R"("request":{"url":"http://example.test/legacy"})");
++  pluginevents::drain(nullptr);
++  assert(Http::sends == 1 && Http::insecureCalls == 1 && Http::caCalls == 0 && !queued());
++}
+diff --git a/test/plugin_verified_http/VerifiedHttpTest.cpp b/test/plugin_verified_http/VerifiedHttpTest.cpp
+new file mode 100644
+index 0000000..b6aca47
+--- /dev/null
++++ b/test/plugin_verified_http/VerifiedHttpTest.cpp
+@@ -0,0 +1,148 @@
++#include <ArduinoJson.h>
++#include <HalStorage.h>
++#include <Logging.h>
++#include <SecureHttpClient.h>
++#include <TrustedTime.h>
++
++#include <cassert>
++#include <string>
++
++#include "util/PluginEventTrust.h"
++#include "util/PluginHttp.h"
++
++int main() {
++  JsonDocument doc;
++  bool verified = false;
++  std::string caFile;
++  deserializeJson(doc, R"({"tls":{"ca_file":"certs/root.pem"}})");
++  plugineventtrust::read(doc.as<JsonVariantConst>(), verified, caFile);
++  assert(verified && caFile == "certs/root.pem");
++  deserializeJson(doc, R"({"tls":{"ca_file":42}})");
++  plugineventtrust::read(doc.as<JsonVariantConst>(), verified, caFile);
++  assert(verified && caFile.empty());
++  deserializeJson(doc, R"({"tls":null})");
++  plugineventtrust::read(doc.as<JsonVariantConst>(), verified, caFile);
++  assert(verified && caFile.empty());
++  deserializeJson(doc, R"({"tls":"ignored"})");
++  plugineventtrust::read(doc.as<JsonVariantConst>(), verified, caFile);
++  assert(verified && caFile.empty());
++  deserializeJson(doc, R"({"tls":{}})");
++  plugineventtrust::read(doc.as<JsonVariantConst>(), verified, caFile);
++  assert(verified && caFile.empty());
++  for (const auto& json :
++       {R"({"browse":{"tls":null}})", R"({"download":{"tls":42}})", R"({"auth":{"poll":{"tls":{}}}})"}) {
++    deserializeJson(doc, json);
++    assert(plugineventtrust::catalogHasTls(doc.as<JsonVariantConst>()));
++  }
++  deserializeJson(doc, "{}");
++  plugineventtrust::read(doc.as<JsonVariantConst>(), verified, caFile);
++  assert(!verified);
++  deserializeJson(doc, R"({"events":{"sleep.enter":{"request":{"tls":{"ca_file":"certs/root.pem"}}}}})");
++  assert(!plugineventtrust::catalogHasTls(doc.as<JsonVariantConst>()));
++  deserializeJson(doc, R"({"auth":{"request":{"tls":{"ca_file":"certs/root.pem"}}}})");
++  assert(plugineventtrust::catalogHasTls(doc.as<JsonVariantConst>()));
++  assert(!plugineventtrust::mayRefresh(true, false));
++  assert(plugineventtrust::mayRefresh(true, true));
++
++  const std::string pem = "-----BEGIN CERTIFICATE-----\n" + std::string(80, 'A') + "\n-----END CERTIFICATE-----\n";
++  Storage.files["/plugins/test/certs/root.pem"] = pem;
++  pluginhttp::VerifiedTrust trust{"/plugins/test", "certs/root.pem"};
++  String response;
++  const pluginhttp::Headers headers{{"Authorization", "Bearer fixture"}};
++  auto run = [&](const std::string& url, const pluginhttp::VerifiedTrust* t, freeink::SecureHttpClient* s = nullptr) {
++    return pluginhttp::request(s, url, "GET", "", headers, response, 1024, nullptr, nullptr, t);
++  };
++#ifdef CROSSPOINT_SDK65_VERIFIED_PEER
++  assert(run("https://example.test/x", &trust) == -1);
++  assert(freeink::SecureHttpClient::begins == 0);
++  trustedtime::fresh = true;
++  assert(run("https://example.test/x", &trust) == 200);
++  assert(freeink::SecureHttpClient::caCalls == 1 && freeink::SecureHttpClient::insecureCalls == 0);
++  assert(run("http://example.test/x", &trust) == -1);
++  const int beginsBeforeInvalidUrl = freeink::SecureHttpClient::begins;
++  const int sendsBeforeInvalidUrl = freeink::SecureHttpClient::sends;
++  const int caBeforeInvalidUrl = freeink::SecureHttpClient::caCalls;
++  fixturelog::output.clear();
++  for (const auto& invalid :
++       {std::string("https://example.test?token=sentinel-query"), std::string("https://sentinel-user@example.test/"),
++        std::string("https:///sentinel-empty"), std::string("https://"), std::string("https://:443/sentinel-empty"),
++        std::string("https://example.test#sentinel-fragment"), std::string("https://example.test/\nsentinel-control"),
++        std::string("https://example.test/") + std::string(1, '\0') + "sentinel-nul"}) {
++    assert(run(invalid, &trust) == -1);
++  }
++  assert(freeink::SecureHttpClient::begins == beginsBeforeInvalidUrl);
++  assert(freeink::SecureHttpClient::sends == sendsBeforeInvalidUrl);
++  assert(freeink::SecureHttpClient::caCalls == caBeforeInvalidUrl);
++  assert(fixturelog::output.find("sentinel") == std::string::npos);
++  assert(run("https://example.test/?token=fixture", &trust) == 200);
++
++  trustedtime::now = 0;
++  assert(run("https://example.test/x", &trust) == -1);
++  trustedtime::now = 1800000000;
++  trustedtime::systemNow = 0;
++  assert(run("https://example.test/x", &trust) == -1);
++  trustedtime::systemNow = 1799999999;
++  assert(run("https://example.test/x", &trust) == -1);
++  trustedtime::systemNow = 1800000000;
++  trust.caFile = "../other.pem";
++  assert(run("https://example.test/x", &trust) == -1);
++  trust.caFile.clear();
++  assert(run("https://example.test/x", &trust) == -1);
++  trust.caFile = "missing.pem";
++  assert(run("https://example.test/x", &trust) == -1);
++  trust.caFile = "certs/root.pem";
++  Storage.files["/plugins/test/certs/root.pem"] = "bad";
++  assert(run("https://example.test/x", &trust) == -1);
++  for (const auto& rel : {"/root.pem", "certs//root.pem", "certs/../root.pem", "certs/", "certs\\root.pem"}) {
++    trust.caFile = rel;
++    assert(run("https://example.test/x", &trust) == -1);
++  }
++  trust.caFile = "certs/root.pem";
++  for (const auto& invalid :
++       {std::string(), std::string(8193, 'A'), std::string("-----BEGIN CERTIFICATE-----\n") + std::string(80, 'A'),
++        std::string("-----BEGIN CERTIFICATE-----\n") + std::string(80, 'A') + std::string(1, '\0') +
++            "-----END CERTIFICATE-----"}) {
++    Storage.files["/plugins/test/certs/root.pem"] = invalid;
++    assert(run("https://example.test/x", &trust) == -1);
++  }
++  const int sends = freeink::SecureHttpClient::sends;
++  assert(pluginhttp::requestToFile(nullptr, "https://example.test/x", "GET", "", headers, "/plugins/test/out.part",
++                                   1024, nullptr, &trust) == -1);
++  std::string minted;
++  assert(!pluginhttp::mintPasswordToken(nullptr, "https://example.test/auth", "POST", "secret", headers, "access_token",
++                                        minted, nullptr, &trust));
++  assert(freeink::SecureHttpClient::sends == sends);
++  Storage.files["/plugins/test/certs/root.pem"] = pem;
++  freeink::SecureHttpClient::reply = "{\"access_token\":\"fixture-token\"}";
++  assert(pluginhttp::mintPasswordToken(nullptr, "https://example.test/auth", "POST", "fixture", headers, "access_token",
++                                       minted, nullptr, &trust));
++  assert(minted == "fixture-token");
++  freeink::SecureHttpClient::reply.clear();
++  assert(pluginhttp::requestToFile(nullptr, "https://example.test/x", "GET", "", headers, "/plugins/test/out.part",
++                                   1024, nullptr, &trust) == 200);
++  const int sendsBeforeAbort = freeink::SecureHttpClient::sends;
++  assert(pluginhttp::request(
++             nullptr, "https://example.test/x", "GET", "", headers, response, 1024, nullptr, [] { return true; },
++             &trust) == -1);
++  assert(freeink::SecureHttpClient::sends == sendsBeforeAbort);
++  freeink::SecureHttpClient::status = -1;
++  fixturelog::output.clear();
++  const std::string sensitive = "https://example.test/sentinel-path?token=sentinel-query";
++  assert(run(sensitive, &trust) == -1);
++  assert(pluginhttp::requestToFile(nullptr, sensitive, "POST", "sentinel-body", {{"Authorization", "sentinel-header"}},
++                                   "/plugins/test/out.part", 1024, nullptr, &trust) == -1);
++  assert(!Storage.exists("/plugins/test/out.part"));
++  assert(fixturelog::output.find("sentinel") == std::string::npos);
++  assert(!fixturelog::output.empty());
++  freeink::SecureHttpClient::status = 200;
++  freeink::SecureHttpClient insecureSession;
++  const int beginsAfterSuccess = freeink::SecureHttpClient::begins;
++  assert(run("https://example.test/x", &trust, &insecureSession) == -1);
++  assert(freeink::SecureHttpClient::begins == beginsAfterSuccess);
++#else
++  assert(run("https://example.test/x", &trust) == -1);
++  assert(freeink::SecureHttpClient::begins == 0);
++#endif
++  assert(run("http://example.test/x", nullptr) == 200);
++  assert(freeink::SecureHttpClient::insecureCalls == 1);
++}
+diff --git a/test/plugin_verified_http/run.py b/test/plugin_verified_http/run.py
+new file mode 100644
+index 0000000..a50f676
+--- /dev/null
++++ b/test/plugin_verified_http/run.py
+@@ -0,0 +1,23 @@
++"""Run actual PluginHttp and PluginEvents against bounded host stubs."""
++from pathlib import Path
++import argparse
++import subprocess
++import tempfile
++parser = argparse.ArgumentParser()
++parser.add_argument("--arduinojson", type=Path)
++parser.add_argument("--sanitize", action="store_true")
++args = parser.parse_args()
++root = Path(__file__).resolve().parents[2]
++here = Path(__file__).resolve().parent
++json = args.arduinojson or root / ".pio/libdeps/x4pro/ArduinoJson/src"
++with tempfile.TemporaryDirectory(prefix="plugin-verified-http-") as tmp:
++    for verified in (False, True):
++        for test in ("VerifiedHttpTest.cpp", "EventTrustTest.cpp"):
++            exe = Path(tmp) / "check"
++            cmd = ["c++", "-std=c++20", "-O0", "-g", "-I", str(here / "stubs"), "-I", str(root / "test/plugin_event_budget/stubs"), "-I", str(json), "-I", str(root / "src"), "-I", str(root / "lib/GfxRenderer"), "-I", str(root / "lib/Memory"), str(root / "src/util/PluginHttp.cpp")]
++            if test == "EventTrustTest.cpp": cmd += [str(root / "src/util/PluginEvents.cpp"), str(root / "src/util/PluginEventAsset.cpp"), str(root / "lib/GfxRenderer/Bitmap.cpp"), str(root / "lib/GfxRenderer/BitmapHelpers.cpp")]
++            if verified: cmd += ["-DCROSSPOINT_SDK65_VERIFIED_PEER"]
++            if args.sanitize: cmd += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
++            subprocess.run(cmd + [str(here / test), "-o", str(exe)], check=True)
++            subprocess.run([str(exe)], check=True)
++            print(f"PASS {test} verified={verified}", flush=True)
+diff --git a/test/plugin_verified_http/stubs/HalStorage.h b/test/plugin_verified_http/stubs/HalStorage.h
+new file mode 100644
+index 0000000..4723011
+--- /dev/null
++++ b/test/plugin_verified_http/stubs/HalStorage.h
+@@ -0,0 +1,84 @@
++#pragma once
++#include <WString.h>
++#include <fcntl.h>
++
++#include <cstdint>
++#include <string>
++#include <unordered_map>
++struct HalFile {
++  std::string* data = nullptr;
++  size_t pos = 0;
++  bool isOpen() const { return data != nullptr; }
++  explicit operator bool() const { return isOpen(); }
++  size_t write(const char* p, size_t n) {
++    if (!data) return 0;
++    data->append(p, n);
++    return n;
++  }
++  size_t write(const uint8_t* p, size_t n) { return write(reinterpret_cast<const char*>(p), n); }
++  void flush() {}
++  void close() { data = nullptr; }
++  uint64_t fileSize64() const { return data ? data->size() : 0; }
++  size_t fileSize() const { return static_cast<size_t>(fileSize64()); }
++  bool seek(uint64_t offset) {
++    if (!data || offset > data->size()) return false;
++    pos = static_cast<size_t>(offset);
++    return true;
++  }
++  bool seekCur(int64_t offset) {
++    if (offset < 0 && static_cast<uint64_t>(-offset) > pos) return false;
++    return seek(pos + offset);
++  }
++  int read() { return !data || pos >= data->size() ? -1 : static_cast<unsigned char>((*data)[pos++]); }
++  size_t read(void* out, size_t count) {
++    auto* bytes = static_cast<unsigned char*>(out);
++    size_t n = 0;
++    while (n < count) {
++      const int c = read();
++      if (c < 0) break;
++      bytes[n++] = static_cast<unsigned char>(c);
++    }
++    return n;
++  }
++  void truncate(uint64_t n) {
++    if (data) data->resize(n);
++  }
++};
++struct StorageStub {
++  std::unordered_map<std::string, std::string> files;
++  bool readFileToString(const char*, const std::string& path, size_t cap, std::string& out) {
++    const auto it = files.find(path);
++    if (it == files.end() || it->second.size() > cap) return false;
++    out = it->second;
++    return true;
++  }
++  bool openFileForWrite(const char*, const std::string& path, HalFile& f) {
++    files[path].clear();
++    f.data = &files[path];
++    return true;
++  }
++  bool openFileForWrite(const char* t, const char* p, HalFile& f) { return openFileForWrite(t, std::string(p), f); }
++  bool openFileForRead(const char*, const std::string& path, HalFile& f) {
++    const auto it = files.find(path);
++    if (it == files.end()) return false;
++    f.data = &it->second;
++    f.pos = 0;
++    return true;
++  }
++  HalFile open(const char* path, int) { return HalFile{&files[path]}; }
++  bool remove(const char* path) { return files.erase(path) != 0; }
++  bool exists(const char* path) const { return files.find(path) != files.end(); }
++  bool rename(const char* from, const char* to) {
++    auto it = files.find(from);
++    if (it == files.end() || exists(to)) return false;
++    std::string value = std::move(it->second);
++    files.erase(it);
++    files[to] = std::move(value);
++    return true;
++  }
++  bool writeFile(const char* path, const String& value) {
++    files[path] = value.value;
++    return true;
++  }
++};
++inline StorageStub Storage;
+diff --git a/test/plugin_verified_http/stubs/Logging.h b/test/plugin_verified_http/stubs/Logging.h
+new file mode 100644
+index 0000000..a82c833
+--- /dev/null
++++ b/test/plugin_verified_http/stubs/Logging.h
+@@ -0,0 +1,16 @@
++#pragma once
++#include <cstdio>
++#include <string>
++namespace fixturelog {
++inline std::string output;
++inline void record(const char*, const char* text) { output += text; }
++template <typename... Args>
++void record(const char*, const char* format, Args... args) {
++  const int size = std::snprintf(nullptr, 0, format, args...);
++  std::string message(static_cast<size_t>(size) + 1, '\0');
++  std::snprintf(message.data(), message.size(), format, args...);
++  output.append(message.data(), static_cast<size_t>(size));
++}
++}  // namespace fixturelog
++#define LOG_ERR(...) fixturelog::record(__VA_ARGS__)
++#define LOG_DBG(...) fixturelog::record(__VA_ARGS__)
+diff --git a/test/plugin_verified_http/stubs/SecureHttpClient.h b/test/plugin_verified_http/stubs/SecureHttpClient.h
+new file mode 100644
+index 0000000..c070186
+--- /dev/null
++++ b/test/plugin_verified_http/stubs/SecureHttpClient.h
+@@ -0,0 +1,63 @@
++#pragma once
++#include <cassert>
++#include <cstdint>
++#include <functional>
++#include <string>
++#include <utility>
++#include <vector>
++#include <TrustedTime.h>
++namespace freeink {
++class SecureHttpClient {
++ public:
++  using DataCallback = std::function<bool(const uint8_t*, size_t)>;
++  using AbortCallback = std::function<bool()>;
++  struct Reply {
++    int status;
++    std::string body;
++    bool complete = true;
++  };
++  static inline int begins = 0, insecureCalls = 0, caCalls = 0, sends = 0;
++  static inline int status = 200;
++  static inline std::string reply;
++  static inline bool complete = true;
++  static inline std::vector<Reply> replies;
++  static inline uint32_t sendDelayMs = 0;
++  static inline bool abortAfterBody = false;
++  static inline std::vector<std::string> urls, headers, bodies;
++  const char* ca = nullptr;
++  void setUserAgent(const char*) {}
++  void setInsecure() { ++insecureCalls; }
++  void setCACert(const char* value) {
++    ca = value;
++    ++caCalls;
++  }
++  void setTimeout(uint32_t) {}
++  void setFollowRedirects(int hops) { assert(hops == 0); }
++  bool begin(const std::string& url) {
++    ++begins;
++    urls.push_back(url);
++    return true;
++  }
++  void addHeader(const std::string& name, const std::string& value) { headers.push_back(name + ":" + value); }
++  int sendRequest(const char*, const uint8_t* body, size_t length, const DataCallback& onData,
++                  const AbortCallback& abort = nullptr) {
++    if (abort && abort()) return -1;
++    if (ca) assert(std::string(ca).find("-----BEGIN CERTIFICATE-----") != std::string::npos);
++    bodies.emplace_back(reinterpret_cast<const char*>(body), length);
++    ++sends;
++    trustedtime::fixtureMs += sendDelayMs;
++    if (!replies.empty()) {
++      auto r = replies.front();
++      replies.erase(replies.begin());
++      status = r.status;
++      reply = r.body;
++      complete = r.complete;
++    }
++    if (!reply.empty() && !onData(reinterpret_cast<const uint8_t*>(reply.data()), reply.size())) complete = false;
++    if (abortAfterBody && abort && abort()) return -1;
++    return status;
++  }
++  bool responseComplete() const { return complete; }
++  std::vector<std::pair<std::string, std::string>> getHeaders() const { return {}; }
++};
++}  // namespace freeink
+diff --git a/test/plugin_verified_http/stubs/TrustedTime.h b/test/plugin_verified_http/stubs/TrustedTime.h
+new file mode 100644
+index 0000000..a8b5c86
+--- /dev/null
++++ b/test/plugin_verified_http/stubs/TrustedTime.h
+@@ -0,0 +1,24 @@
++#pragma once
++#include <time.h>
++
++#include <cstdint>
++#include <functional>
++namespace trustedtime {
++inline int64_t now = 1800000000;
++inline int64_t systemNow = 1800000000;
++inline bool fresh = false;
++inline bool syncSucceeds = true;
++inline int syncAttempts = 0;
++inline uint32_t fixtureMs = 0;
++inline uint32_t syncDelayMs = 0;
++inline int64_t trustedNow() { return now; }
++inline bool hasFreshSync() { return fresh; }
++inline bool syncFresh(uint32_t, const std::function<bool()>& shouldAbort = nullptr) {
++  ++syncAttempts;
++  fixtureMs += syncDelayMs;
++  fresh = syncSucceeds && !(shouldAbort && shouldAbort());
++  return fresh;
++}
++}  // namespace trustedtime
++inline time_t fixtureTime(time_t*) { return static_cast<time_t>(trustedtime::systemNow); }
++#define time fixtureTime
+diff --git a/test/plugin_verified_http/stubs/WString.h b/test/plugin_verified_http/stubs/WString.h
+new file mode 100644
+index 0000000..3b797bf
+--- /dev/null
++++ b/test/plugin_verified_http/stubs/WString.h
+@@ -0,0 +1,25 @@
++#pragma once
++#include <string>
++class String {
++ public:
++  String() = default;
++  explicit String(const char* s) : value(s) {}
++  void remove(size_t) { value.clear(); }
++  size_t length() const { return value.size(); }
++  bool reserve(size_t n) {
++    value.reserve(n);
++    return true;
++  }
++  bool concat(const char* p, size_t n) {
++    value.append(p, n);
++    return true;
++  }
++  int read() { return pos < value.size() ? static_cast<unsigned char>(value[pos++]) : -1; }
++  size_t readBytes(char* out, size_t n) {
++    size_t copied = 0;
++    while (copied < n && pos < value.size()) out[copied++] = value[pos++];
++    return copied;
++  }
++  std::string value;
++  size_t pos = 0;
++};
+diff --git a/test/plugin_verified_http/stubs/components/UITheme.h b/test/plugin_verified_http/stubs/components/UITheme.h
+new file mode 100644
+index 0000000..e6749d7
+--- /dev/null
++++ b/test/plugin_verified_http/stubs/components/UITheme.h
+@@ -0,0 +1,6 @@
++#pragma once
++class GfxRenderer {};
++struct FixtureGUI {
++  void drawPopup(GfxRenderer&, const char*) {}
++};
++inline FixtureGUI GUI;
+diff --git a/test/plugin_verified_http/stubs/esp_random.h b/test/plugin_verified_http/stubs/esp_random.h
+new file mode 100644
+index 0000000..1cc5215
+--- /dev/null
++++ b/test/plugin_verified_http/stubs/esp_random.h
+@@ -0,0 +1,3 @@
++#pragma once
++#include <cstdint>
++inline uint32_t esp_random() { return 123; }
+diff --git a/test/plugin_verified_http/stubs/network/WifiPowerSaveGuard.h b/test/plugin_verified_http/stubs/network/WifiPowerSaveGuard.h
+new file mode 100644
+index 0000000..f6c3367
+--- /dev/null
++++ b/test/plugin_verified_http/stubs/network/WifiPowerSaveGuard.h
+@@ -0,0 +1,2 @@
++#pragma once
++struct WifiPowerSaveGuard {};
+diff --git a/test/trusted_time_fresh/FreshTimeTest.cpp b/test/trusted_time_fresh/FreshTimeTest.cpp
+new file mode 100644
+index 0000000..042505b
+--- /dev/null
++++ b/test/trusted_time_fresh/FreshTimeTest.cpp
+@@ -0,0 +1,114 @@
++#include <TrustedTime.h>
++#include <Arduino.h>
++#include <esp_sntp.h>
++
++#include <cassert>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <sys/time.h>
++#include <time.h>
++
++int64_t testPersistedFloor = 0;
++static int64_t now = 1800000000;
++static uint32_t ms = 0;
++static uint32_t callbackAfter = UINT32_MAX;
++static int64_t callbackValue = 0;
++static void (*callback)(timeval*) = nullptr;
++static std::string lastTz;
++static int configs = 0;
++static int status = SNTP_SYNC_STATUS_COMPLETED;
++extern "C" time_t time(time_t* out) {
++  if (out) *out = static_cast<time_t>(now);
++  return static_cast<time_t>(now);
++}
++extern "C" int settimeofday(const timeval* tv, const struct timezone*) {
++  now = tv->tv_sec;
++  return 0;
++}
++uint32_t millis() { return ms; }
++void delay(uint32_t n) {
++  ms += n;
++  if (callbackAfter != UINT32_MAX && static_cast<uint32_t>(ms - callbackAfter) < 1000) {
++    now = callbackValue;
++    callbackAfter = UINT32_MAX;
++    timeval tv{};
++    callback(&tv);
++  }
++}
++void configTzTime(const char* tz, const char*) {
++  lastTz = tz;
++  ++configs;
++}
++void sntp_set_time_sync_notification_cb(void (*cb)(timeval*)) { callback = cb; }
++bool esp_sntp_enabled() { return false; }
++int sntp_get_sync_status() { return status; }
++static void schedule(uint32_t wait, int64_t epoch) {
++  callbackAfter = ms + wait;
++  callbackValue = epoch;
++}
++int main() {
++  setenv("TZ", "CET-1CEST", 1);
++  trustedtime::init();
++  assert(callback);
++  assert(!trustedtime::hasFreshSync());
++  // A stale COMPLETED status and plausible saved time do not prove a new sync.
++  assert(!trustedtime::syncFresh(100));
++  assert(!trustedtime::hasFreshSync() && configs == 1 && lastTz == "CET-1CEST");
++  schedule(50, 1800000100);
++  assert(trustedtime::syncFresh(1000));
++  assert(trustedtime::hasFreshSync());
++  // Direct verified calls may use this proof briefly, but a new failed
++  // cycle invalidates it even when abort happens before SNTP restarts.
++  const int preAbortConfigs = configs;
++  assert(!trustedtime::syncFresh(1000, [] { return true; }));
++  assert(configs == preAbortConfigs && !trustedtime::hasFreshSync());
++  assert(!trustedtime::syncFresh(0));
++  assert(!trustedtime::hasFreshSync());
++  schedule(50, 1800000100);
++  assert(trustedtime::syncFresh(1000));
++  assert(testPersistedFloor >= 1800000100);
++  // The existing APIs continue to accept a floor and a stale global status.
++  assert(trustedtime::trustedNow() >= 1800000100);
++  assert(trustedtime::syncNow(100));
++  trustedtime::note();
++  // New callback below a previously observed floor must fail, without rollback.
++  schedule(50, 1800000000);
++  assert(!trustedtime::syncFresh(1000));
++  assert(!trustedtime::hasFreshSync());
++  assert(trustedtime::trustedNow() >= 1800000100);
++  now = 1800000200;
++  testPersistedFloor = 1900000000;
++  schedule(50, 1800000300);
++  assert(!trustedtime::syncFresh(1000));
++  assert(!trustedtime::hasFreshSync());
++  // Abort both before configure and after the callback. No proof survives.
++  const int oldConfigs = configs;
++  assert(!trustedtime::syncFresh(1000, [] { return true; }));
++  assert(configs == oldConfigs);
++  testPersistedFloor = 1800000100;
++  now = 1800000300;
++  schedule(50, 1800000400);
++  assert(!trustedtime::syncFresh(1000, [] { return callbackAfter == UINT32_MAX; }));
++  assert(!trustedtime::hasFreshSync());
++  // Wrap-safe bounded wait and proof age.
++  ms = UINT32_MAX - 20;
++  schedule(50, 1800000500);
++  assert(trustedtime::syncFresh(200));
++  assert(trustedtime::hasFreshSync());
++  ms += 30000;
++  assert(!trustedtime::hasFreshSync());
++  schedule(50, 1800000600);
++  assert(trustedtime::syncFresh(200));
++  assert(trustedtime::hasFreshSync());
++  // Model a full millis() revolution plus 10 ms: modulo age looks recent,
++  // while the wall clock advanced by over 49 days.
++  ms += 10;
++  now += 4294968;
++  assert(!trustedtime::hasFreshSync());
++  schedule(50, 1800000700);
++  assert(trustedtime::syncFresh(200));
++  now += 31;
++  assert(!trustedtime::hasFreshSync());
++  assert(lastTz == "CET-1CEST");
++}
+diff --git a/test/trusted_time_fresh/run.py b/test/trusted_time_fresh/run.py
+new file mode 100644
+index 0000000..b922f59
+--- /dev/null
++++ b/test/trusted_time_fresh/run.py
+@@ -0,0 +1,14 @@
++from pathlib import Path
++import subprocess
++import tempfile
++
++root = Path(__file__).resolve().parents[2]
++here = Path(__file__).resolve().parent
++with tempfile.TemporaryDirectory(prefix="trusted-time-fresh-") as tmp:
++    exe = Path(tmp) / "check"
++    subprocess.run(["c++", "-std=c++20", "-O0", "-g", "-fsanitize=address,undefined",
++                    "-fno-omit-frame-pointer", "-I", str(here / "stubs"),
++                    "-I", str(root / "lib/TrustedTime"), str(root / "lib/TrustedTime/TrustedTime.cpp"),
++                    str(here / "FreshTimeTest.cpp"), "-o", str(exe)], check=True)
++    subprocess.run([str(exe)], check=True)
++print("TrustedTime production freshness cases PASS (ASan/UBSan)")
+diff --git a/test/trusted_time_fresh/stubs/Arduino.h b/test/trusted_time_fresh/stubs/Arduino.h
+new file mode 100644
+index 0000000..3a68e50
+--- /dev/null
++++ b/test/trusted_time_fresh/stubs/Arduino.h
+@@ -0,0 +1,9 @@
++#pragma once
++#include <cstdint>
++struct portMUX_TYPE {};
++#define portMUX_INITIALIZER_UNLOCKED {}
++#define portENTER_CRITICAL(x) ((void)0)
++#define portEXIT_CRITICAL(x) ((void)0)
++uint32_t millis();
++void delay(uint32_t);
++void configTzTime(const char*, const char*);
+diff --git a/test/trusted_time_fresh/stubs/Logging.h b/test/trusted_time_fresh/stubs/Logging.h
+new file mode 100644
+index 0000000..182e713
+--- /dev/null
++++ b/test/trusted_time_fresh/stubs/Logging.h
+@@ -0,0 +1,2 @@
++#pragma once
++#define LOG_DBG(...) ((void)0)
+diff --git a/test/trusted_time_fresh/stubs/Preferences.h b/test/trusted_time_fresh/stubs/Preferences.h
+new file mode 100644
+index 0000000..3cb7c97
+--- /dev/null
++++ b/test/trusted_time_fresh/stubs/Preferences.h
+@@ -0,0 +1,10 @@
++#pragma once
++#include <cstdint>
++extern int64_t testPersistedFloor;
++class Preferences {
++ public:
++  bool begin(const char*, bool) { return true; }
++  int64_t getLong64(const char*, int64_t) { return testPersistedFloor; }
++  void putLong64(const char*, int64_t value) { testPersistedFloor = value; }
++  void end() {}
++};
+diff --git a/test/trusted_time_fresh/stubs/esp_sntp.h b/test/trusted_time_fresh/stubs/esp_sntp.h
+new file mode 100644
+index 0000000..5fe514a
+--- /dev/null
++++ b/test/trusted_time_fresh/stubs/esp_sntp.h
+@@ -0,0 +1,6 @@
++#pragma once
++#include <sys/time.h>
++enum { SNTP_SYNC_STATUS_COMPLETED = 1 };
++void sntp_set_time_sync_notification_cb(void (*)(struct timeval*));
++bool esp_sntp_enabled();
++int sntp_get_sync_status();

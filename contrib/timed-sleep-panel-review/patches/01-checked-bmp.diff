@@ -1,0 +1,663 @@
+diff --git a/docs/plugin-events.md b/docs/plugin-events.md
+index 3857446c..9397b61e 100644
+--- a/docs/plugin-events.md
++++ b/docs/plugin-events.md
+@@ -135,6 +135,25 @@ One handler per event. A handler is either:
+   screen renders, and the CUSTOM sleep mode reads `/sleep.bmp` first, so the
+   fetched image appears on that very sleep.
+ 
++For an image that must preserve the last usable frame, opt in with
++`"format": "bmp", "width": 800, "height": 480` inside `download` (use the
++actual raster dimensions). This checked profile accepts only HTTP 200 and
++complete uncompressed BI_RGB BMPs with a 40-byte DIB header, supported by the
++existing Custom sleep decoder, within the 1MB download cap. The declared BMP
++file size must match the received bytes; all pixel rows must be present.
++`width` and `height` must be positive JSON integers within the decoder limits
++(2048 and 3072 respectively), matching the downloaded raster.
++
++Invalid content, 204/206, a failed SD write or replacement keeps the event
++queued and preserves the previous image at `dest` or `dest.bak`. Before the
++next request the handler restores a usable backup left by an interrupted swap.
++A cleanup failure may retain both files until the next drain. This does not
++promise filesystem atomicity across power loss. Unknown, empty, or non-string
++`format`, and invalid dimensions, also keep the event queued without sending a
++request. Fix or remove the handler to unblock it; removing the handler permits
++the existing queue cleanup. Downloads without `format` keep their generic
++response behavior, including all successful 2xx statuses.
++
+ Optional per handler:
+ 
+ - **`toast`** — a template shown as the standard popup after the request
+diff --git a/src/util/PluginEventAsset.cpp b/src/util/PluginEventAsset.cpp
+new file mode 100644
+index 00000000..24b580d6
+--- /dev/null
++++ b/src/util/PluginEventAsset.cpp
+@@ -0,0 +1,103 @@
++#include "PluginEventAsset.h"
++
++#include <Bitmap.h>
++#include <HalStorage.h>
++#include <Logging.h>
++#include <Memory.h>
++
++#include <cstdint>
++
++namespace plugineventasset {
++namespace {
++constexpr uint64_t MAX_BYTES = 1024 * 1024;
++
++uint32_t le32(const uint8_t* bytes) {
++  uint32_t value = 0;
++  for (unsigned shift = 0; shift < 32; shift += 8) {
++    value |= static_cast<uint32_t>(bytes[shift / 8]) << shift;
++  }
++  return value;
++}
++uint16_t le16(const uint8_t* bytes) { return static_cast<uint16_t>(bytes[0]) | (static_cast<uint16_t>(bytes[1]) << 8); }
++}  // namespace
++
++bool validBmp(const std::string& path, const int width, const int height) {
++  if (width < 0 || width > 2048 || height < 0 || height > 3072 || (width == 0) != (height == 0)) return false;
++  HalFile file;
++  if (!Storage.openFileForRead("PEVT", path, file)) return false;
++  const uint64_t size = file.fileSize64();
++  if (size < 54 || size > MAX_BYTES) return false;
++  uint8_t header[54];
++  if (file.read(header, sizeof(header)) != sizeof(header)) return false;
++  const uint32_t offset = le32(header + 10);
++  const uint32_t dibSize = le32(header + 14);
++  const uint32_t rawWidth = le32(header + 18);
++  const uint32_t rawHeight = le32(header + 22);
++  const uint32_t imageHeight = rawHeight & 0x80000000u ? 0u - rawHeight : rawHeight;
++  const uint16_t bpp = le16(header + 28);
++  const uint32_t compression = le32(header + 30);
++  uint32_t colors = le32(header + 46);
++  // Require a 40-byte DIB so the palette offset matches Bitmap::parseHeaders().
++  if (le16(header) != 0x4d42 || le32(header + 2) != size || dibSize != 40 || rawWidth == 0 || rawWidth > 2048 ||
++      rawHeight == 0x80000000u || imageHeight == 0 || imageHeight > 3072 ||
++      (width && rawWidth != static_cast<uint32_t>(width)) || (height && imageHeight != static_cast<uint32_t>(height))) {
++    return false;
++  }
++  // The decoder does not parse BI_BITFIELDS masks; accept BI_RGB only.
++  if (compression != 0 || (bpp != 1 && bpp != 2 && bpp != 4 && bpp != 8 && bpp != 24 && bpp != 32)) return false;
++  if (colors == 0 && bpp <= 8) colors = 1u << bpp;
++  if (colors > 256 || offset < 54 + colors * 4 || offset > size) return false;
++  const uint64_t rowBytes = (static_cast<uint64_t>(rawWidth) * bpp + 31) / 32 * 4;
++  if (rowBytes * imageHeight > size - offset) return false;
++
++  // Use the sleep-screen decoder; heap allocation keeps its palette off the task stack.
++  auto bitmap = makeUniqueNoThrow<Bitmap>(file);
++  if (!bitmap) {
++    LOG_ERR("PEVT", "OOM checking BMP");
++    return false;
++  }
++  if (bitmap->parseHeaders() != BmpReaderError::Ok) return false;
++  if (bitmap->getWidth() != static_cast<int>(rawWidth) || bitmap->getHeight() != static_cast<int>(imageHeight)) {
++    return false;
++  }
++  return true;
++}
++
++bool recover(const std::string& dest) {
++  const std::string bak = dest + ".bak";
++  if (!Storage.exists(bak.c_str())) return true;
++  if (Storage.exists(dest.c_str()) && validBmp(dest, 0, 0)) {
++    // A valid destination takes precedence over a leftover backup.
++    return Storage.remove(bak.c_str());
++  }
++  if (!validBmp(bak, 0, 0)) {
++    LOG_ERR("PEVT", "unusable image backup: %s", bak.c_str());
++    return false;
++  }
++  if (Storage.exists(dest.c_str()) && !Storage.remove(dest.c_str())) return false;
++  if (!Storage.rename(bak.c_str(), dest.c_str())) {
++    LOG_ERR("PEVT", "image recovery failed: %s", dest.c_str());
++    return false;
++  }
++  return true;
++}
++
++bool commit(const std::string& dest, const int width, const int height, const int status) {
++  if (status != 200) return false;
++  const std::string tmp = dest + ".part";
++  if (!validBmp(tmp, width, height) || !recover(dest)) return false;
++  const std::string bak = dest + ".bak";
++  const bool hadDest = Storage.exists(dest.c_str());
++  if (hadDest && !Storage.rename(dest.c_str(), bak.c_str())) return false;
++  if (!Storage.rename(tmp.c_str(), dest.c_str())) {
++    if (hadDest && !Storage.rename(bak.c_str(), dest.c_str())) {
++      LOG_ERR("PEVT", "image rollback pending: %s", bak.c_str());
++    }
++    return false;
++  }
++  // If cleanup fails, the next drain verifies dest before discarding bak.
++  if (hadDest) Storage.remove(bak.c_str());
++  return true;
++}
++
++}  // namespace plugineventasset
+diff --git a/src/util/PluginEventAsset.h b/src/util/PluginEventAsset.h
+new file mode 100644
+index 00000000..f329789d
+--- /dev/null
++++ b/src/util/PluginEventAsset.h
+@@ -0,0 +1,17 @@
++#pragma once
++
++#include <string>
++
++namespace plugineventasset {
++
++// Require exact dimensions; (0, 0) accepts any supported size for backup recovery.
++bool validBmp(const std::string& path, int width, int height);
++
++// Resolve a leftover .bak; false means validation, cleanup or restore failed.
++bool recover(const std::string& dest);
++
++// Replaces dest with a checked .part file; false leaves the old bytes at dest
++// or at dest.bak for recovery on the next drain.
++bool commit(const std::string& dest, int width, int height, int status);
++
++}  // namespace plugineventasset
+diff --git a/src/util/PluginEvents.cpp b/src/util/PluginEvents.cpp
+index 733a59be..99d69db9 100644
+--- a/src/util/PluginEvents.cpp
++++ b/src/util/PluginEvents.cpp
+@@ -11,6 +11,7 @@
+ #include <string>
+ #include <vector>
+ 
++#include "PluginEventAsset.h"
+ #include "PluginHttp.h"
+ #include "PluginLocations.h"
+ #include "components/UITheme.h"
+@@ -211,6 +212,8 @@ struct DrainManifest {
+     // "download" variant: the response streams to `dest` on SD (e.g. a fresh
+     // sleep image) instead of being read as an acknowledgement.
+     std::string dest;
++    bool checkedBmp = false, invalidFormat = false;
++    int width = 0, height = 0;
+     bool isDownload() const { return !dest.empty(); }
+   };
+   std::vector<Handler> handlers;
+@@ -250,6 +253,14 @@ bool loadDrainManifest(const Subscriber& sub, DrainManifest& out) {
+     if (dl["url"].as<const char*>()) {
+       pluginhttp::readRequest(dl, "GET", h.req);
+       h.dest = dl["dest"] | "";
++      if (!dl["format"].isUnbound()) {
++        const char* format = dl["format"].as<const char*>();
++        h.checkedBmp = format && strcmp(format, "bmp") == 0;
++        h.invalidFormat = !h.checkedBmp;
++        // Dimensions must be JSON integers, not coerced strings or fractions.
++        if (dl["width"].is<int>()) h.width = dl["width"].as<int>();
++        if (dl["height"].is<int>()) h.height = dl["height"].as<int>();
++      }
+       if (h.dest.empty()) continue;  // a download without a destination is meaningless
+     } else {
+       pluginhttp::readRequest(kv.value()["request"], "POST", h.req);
+@@ -328,6 +339,11 @@ bool deliverLine(const DrainManifest& mf, const std::string& lineText, std::stri
+         LOG_ERR("PEVT", "unsafe download dest rejected: %s", dest.c_str());
+         return 200;  // treat as delivered: retrying can never fix the manifest
+       }
++      if (handler->invalidFormat) return -1;
++      if (handler->checkedBmp && (handler->width <= 0 || handler->width > 2048 || handler->height <= 0 ||
++                                  handler->height > 3072 || !plugineventasset::recover(dest))) {
++        return -1;
++      }
+       // Generous for images (a 4-bit 800x480 BMP is ~192KB), still bounded.
+       constexpr size_t MAX_EVENT_DOWNLOAD = 1024 * 1024;
+       // Stream to a sibling temp and swap it in only on a clean 2xx, so a
+@@ -338,6 +354,14 @@ bool deliverLine(const DrainManifest& mf, const std::string& lineText, std::stri
+           drainSubstituted(handler->req.body, tok, config, meta, vars, ts, id), headers, tmp.c_str(),
+           MAX_EVENT_DOWNLOAD);
+       if (st >= 200 && st < 300) {
++        if (handler->checkedBmp) {
++          // Only a complete 200 BMP may replace the previous image.
++          if (!plugineventasset::commit(dest, handler->width, handler->height, st)) {
++            Storage.remove(tmp.c_str());
++            return -1;
++          }
++          return st;
++        }
+         // rename won't overwrite an existing file, so park the old dest as a
+         // backup and restore it if the swap fails: a failed commit must not
+         // lose both the old file and the fresh download. -1 (local failure,
+diff --git a/test/plugin_event_asset/AssetTest.cpp b/test/plugin_event_asset/AssetTest.cpp
+new file mode 100644
+index 00000000..7ca56b92
+--- /dev/null
++++ b/test/plugin_event_asset/AssetTest.cpp
+@@ -0,0 +1,299 @@
++#include <ArduinoJson.h>
++#include <HalStorage.h>
++#include <Logging.h>
++
++#include <algorithm>
++#include <cassert>
++#include <cctype>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++#include "network/ProtectedPaths.h"
++#include "util/PluginEventAsset.h"
++#include "util/PluginEvents.h"
++#include "util/PluginHttp.h"
++
++class GfxRenderer {};
++struct GuiStub {
++  void drawPopup(GfxRenderer&, const char*) {}
++};
++inline GuiStub GUI;
++
++// Production HTTP vocabulary helpers; only transport/token I/O are stubbed.
++#include "ProductionHttp.inc"
++namespace pluginhttp {
++int replyStatus = 200, sends = 0;
++std::string replyBody;
++int requestToFile(freeink::SecureHttpClient*, const std::string&, const std::string&, const std::string&,
++                  const Headers&, const char* dest, size_t cap) {
++  ++sends;
++  if (replyBody.size() > cap) return -1;
++  Storage.files[dest] = replyBody;
++  return replyStatus;
++}
++int request(freeink::SecureHttpClient*, const std::string&, const std::string&, const std::string&, const Headers&,
++            String&, size_t, Headers*, const std::function<bool()>&) {
++  ++sends;
++  return replyStatus;
++}
++bool loadTokenFromFile(const std::string&, const std::string&, std::string&) { return true; }
++bool saveTokenToFile(const std::string&, const std::string&, const std::string&) { return true; }
++void loadConfigFile(const std::string&, Headers&) {}
++bool mintPasswordToken(freeink::SecureHttpClient*, const std::string&, const std::string&, const std::string&,
++                       const Headers&, const std::string&, std::string&) {
++  return false;
++}
++}  // namespace pluginhttp
++
++// Unmodified production manifest parser, delivery and queue drain.
++#include "ProductionDrain.inc"
++
++namespace {
++void le16(std::string& s, size_t at, uint16_t v) {
++  s[at] = static_cast<char>(v);
++  s[at + 1] = static_cast<char>(v >> 8);
++}
++void le32(std::string& s, size_t at, uint32_t v) {
++  for (size_t i = 0; i < 4; ++i) s[at + i] = static_cast<char>(v >> (i * 8));
++}
++std::string bmp(unsigned char color = 0) {
++  // 2x2, 24-bit BI_RGB; each row is 8 bytes including padding.
++  std::string s(70, '\0');
++  for (size_t i = 54; i < s.size(); ++i) s[i] = static_cast<char>(color);
++  le16(s, 0, 0x4d42);
++  le32(s, 2, 70);
++  le32(s, 10, 54);
++  le32(s, 14, 40);
++  le32(s, 18, 2);
++  le32(s, 22, 2);
++  le16(s, 26, 1);
++  le16(s, 28, 24);
++  le32(s, 30, 0);
++  le32(s, 34, 16);
++  return s;
++}
++void reset() { Storage = StorageStub{}; }
++}  // namespace
++
++void helperChecks() {
++  // Destination insertion can rehash the map; rename must erase by key.
++  reset();
++  Storage.files["/from"] = "old";
++  Storage.files.max_load_factor(Storage.files.load_factor());
++  const size_t buckets = Storage.files.bucket_count();
++  assert(Storage.rename("/from", "/to"));
++  assert(Storage.files.bucket_count() > buckets);
++  assert(!Storage.exists("/from") && Storage.files["/to"] == "old");
++  const std::string old = bmp(1), fresh = bmp(2);
++  reset();
++  Storage.files["/sleep.bmp"] = old;
++  Storage.files["/sleep.bmp.part"] = fresh;
++  assert(plugineventasset::validBmp("/sleep.bmp.part", 2, 2));
++  assert(!plugineventasset::validBmp("/sleep.bmp.part", 3, 2));
++  assert(plugineventasset::commit("/sleep.bmp", 2, 2, 200));
++  assert(Storage.files["/sleep.bmp"] == fresh && !Storage.exists("/sleep.bmp.bak"));
++
++  // A complete-looking header with missing pixel rows must never replace old.
++  for (const std::string bad :
++       {std::string("<html>bad</html>"), fresh.substr(0, 60), std::string(1024 * 1024 + 1, 'x')}) {
++    reset();
++    Storage.files["/sleep.bmp"] = old;
++    Storage.files["/sleep.bmp.part"] = bad;
++    assert(!plugineventasset::commit("/sleep.bmp", 2, 2, 200));
++    assert(Storage.files["/sleep.bmp"] == old);
++  }
++  // Parser edge cases must be rejected before Bitmap reads beyond the DIB.
++  for (const int edge : {0, 1, 2, 3, 4}) {
++    std::string bad = fresh;
++    if (edge == 0) le32(bad, 22, 0x80000000u);   // negating INT32_MIN overflows
++    if (edge == 1) le32(bad, 10, 54 + 256 * 4);  // pixel offset beyond file
++    if (edge == 2) le32(bad, 14, 124);           // extended DIB not parsed by this caller
++    if (edge == 3) le32(bad, 2, 69);             // declared BMP size differs from bytes
++    if (edge == 4) {
++      le16(bad, 28, 32);
++      le32(bad, 30, 3);  // BI_BITFIELDS without parsed masks
++    }
++    reset();
++    Storage.files["/sleep.bmp.part"] = bad;
++    assert(!plugineventasset::validBmp("/sleep.bmp.part", 2, 2));
++  }
++  reset();
++  Storage.files["/sleep.bmp"] = old;
++  Storage.files["/sleep.bmp.part"] = fresh;
++  for (const int status : {204, 206, 404, -1}) {
++    assert(!plugineventasset::commit("/sleep.bmp", 2, 2, status));
++    assert(Storage.files["/sleep.bmp"] == old);
++  }
++
++  // Failing either rename keeps last-good, at dest or at its recoverable bak.
++  reset();
++  Storage.files["/sleep.bmp"] = old;
++  Storage.files["/sleep.bmp.part"] = fresh;
++  Storage.failRenameFrom = "/sleep.bmp";
++  assert(!plugineventasset::commit("/sleep.bmp", 2, 2, 200));
++  assert(Storage.files["/sleep.bmp"] == old);
++
++  reset();
++  Storage.files["/sleep.bmp"] = old;
++  Storage.files["/sleep.bmp.part"] = fresh;
++  Storage.failRenameFrom = "/sleep.bmp.part";
++  assert(!plugineventasset::commit("/sleep.bmp", 2, 2, 200));
++  assert(Storage.files["/sleep.bmp"] == old);
++
++  reset();
++  Storage.files["/sleep.bmp"] = old;
++  Storage.files["/sleep.bmp.part"] = fresh;
++  Storage.failRenameFrom = "/sleep.bmp.part";
++  Storage.failRenameTo = "/sleep.bmp";
++  assert(!plugineventasset::commit("/sleep.bmp", 2, 2, 200));
++  assert(Storage.files["/sleep.bmp.bak"] == old);
++  Storage.failRenameFrom.clear();
++  Storage.failRenameTo.clear();
++  assert(plugineventasset::recover("/sleep.bmp"));
++  assert(Storage.files["/sleep.bmp"] == old);
++
++  // Reset states: backup only, valid dest + stale backup, corrupt dest + good backup.
++  reset();
++  Storage.files["/sleep.bmp.bak"] = old;
++  Storage.files["/sleep.bmp.part"] = "bad";
++  assert(plugineventasset::recover("/sleep.bmp"));
++  assert(Storage.files["/sleep.bmp"] == old);
++  reset();
++  Storage.files["/sleep.bmp"] = fresh;
++  Storage.files["/sleep.bmp.bak"] = old;
++  assert(plugineventasset::recover("/sleep.bmp"));
++  assert(Storage.files["/sleep.bmp"] == fresh && !Storage.exists("/sleep.bmp.bak"));
++  reset();
++  Storage.files["/sleep.bmp"] = "bad";
++  Storage.files["/sleep.bmp.bak"] = old;
++  assert(plugineventasset::recover("/sleep.bmp"));
++  assert(Storage.files["/sleep.bmp"] == old);
++
++  // A failed SD removal must not discard the only valid backup.
++  reset();
++  Storage.files["/sleep.bmp"] = "bad";
++  Storage.files["/sleep.bmp.bak"] = old;
++  Storage.failRemove = "/sleep.bmp";
++  assert(!plugineventasset::recover("/sleep.bmp"));
++  assert(Storage.files["/sleep.bmp.bak"] == old);
++}
++
++namespace {
++const std::string queued = R"({"e":"sleep.enter","id":"test","ts":1,"vars":{}})"
++                           "\n";
++const char* queuePath = "/plugins/fixture/events.jsonl";
++void setupDownload(const std::string& fields, int status, const std::string& body) {
++  reset();
++  for (auto& sub : subscribers) sub = Subscriber{};
++  strcpy(subscribers[0].name, "fixture");
++  strcpy(subscribers[0].dir, "/plugins/fixture");
++  Storage.files["/plugins/fixture/device.json"] =
++      R"({"events":{"sleep.enter":{"download":{"url":"https://fixture.invalid/frame","dest":"/sleep.bmp")" + fields +
++      "}}}}";
++  Storage.files[queuePath] = queued;
++  Storage.files["/sleep.bmp"] = bmp(1);
++  pluginhttp::sends = 0;
++  pluginhttp::replyStatus = status;
++  pluginhttp::replyBody = body;
++}
++void expectQueued(const std::string& fields, int status, const std::string& body, int sends) {
++  setupDownload(fields, status, body);
++  pluginevents::drain(nullptr, 4);
++  assert(Storage.files[queuePath] == queued);
++  assert(Storage.files["/sleep.bmp"] == bmp(1));
++  assert(pluginhttp::sends == sends);
++  assert(!Storage.exists("/sleep.bmp.part"));
++}
++}  // namespace
++
++int main() {
++  helperChecks();
++  const std::string checked = R"(,"format":"bmp","width":2,"height":2)";
++  for (const std::string format : {"null", "true", "42", "{}", "[]", "\"\"", "\"png\""}) {
++    expectQueued(",\"format\":" + format + ",\"width\":2,\"height\":2", 200, bmp(2), 0);
++  }
++  for (const std::string value : {"null", "true", "\"2\"", "2.5", "0", "-2", "2147483648", "{}", "[]"}) {
++    expectQueued(",\"format\":\"bmp\",\"width\":" + value + ",\"height\":2", 200, bmp(2), 0);
++    expectQueued(",\"format\":\"bmp\",\"width\":2,\"height\":" + value, 200, bmp(2), 0);
++  }
++  for (const std::string fields : {R"(,"format":"bmp")", R"(,"format":"bmp","width":2049,"height":2)",
++                                   R"(,"format":"bmp","width":2,"height":3073)"}) {
++    expectQueued(fields, 200, bmp(2), 0);
++  }
++  expectQueued(checked, 200, "<html>error</html>", 1);
++  expectQueued(checked, 200, bmp(2).substr(0, 60), 1);
++  for (int status : {204, 206, 304, 401, 500, -1}) expectQueued(checked, status, bmp(2), 1);
++  expectQueued(R"(,"format":"bmp","width":3,"height":2)", 200, bmp(2), 1);
++
++  setupDownload(checked, 200, bmp(2));
++  pluginevents::drain(nullptr, 4);
++  assert(!Storage.exists(queuePath) && Storage.files["/sleep.bmp"] == bmp(2));
++  assert(pluginhttp::sends == 1);
++
++  // No format means legacy generic, even with unrelated malformed dimensions.
++  for (int status : {200, 204, 206, 299}) {
++    setupDownload(R"(,"width":"bad","height":false)", status, "generic body");
++    pluginevents::drain(nullptr, 4);
++    assert(!Storage.exists(queuePath) && Storage.files["/sleep.bmp"] == "generic body");
++  }
++  expectQueued("", 500, "error", 1);
++
++  // Queue order and delivered-prefix rewrite use the actual drain.
++  setupDownload(checked, 200, bmp(2));
++  Storage.files[queuePath] += queued;
++  pluginevents::drain(nullptr, 1);
++  assert(Storage.files[queuePath] == queued && pluginhttp::sends == 1);
++
++  // Backup-only reset is recovered before an unsuccessful request.
++  setupDownload(checked, 500, "error");
++  Storage.files.erase("/sleep.bmp");
++  Storage.files["/sleep.bmp.bak"] = bmp(1);
++  pluginevents::drain(nullptr, 4);
++  assert(Storage.files["/sleep.bmp"] == bmp(1) && !Storage.exists("/sleep.bmp.bak"));
++  assert(Storage.files[queuePath] == queued);
++
++  // Failed park, failed install, and failed rollback preserve last-good.
++  for (int fault : {0, 1, 2}) {
++    setupDownload(checked, 200, bmp(2));
++    Storage.failRenameFrom = fault == 0 ? "/sleep.bmp" : "/sleep.bmp.part";
++    if (fault == 2) Storage.failRenameTo = "/sleep.bmp";
++    pluginevents::drain(nullptr, 4);
++    assert(Storage.files[queuePath] == queued);
++    assert(!Storage.exists("/sleep.bmp.part"));
++    assert(Storage.files[fault == 2 ? "/sleep.bmp.bak" : "/sleep.bmp"] == bmp(1));
++    Storage.failRenameFrom.clear();
++    Storage.failRenameTo.clear();
++    pluginhttp::replyStatus = 500;
++    pluginevents::drain(nullptr, 4);
++    assert(Storage.files["/sleep.bmp"] == bmp(1));
++  }
++  // Failed stale-backup removal prevents a request and preserves both images.
++  setupDownload(checked, 200, bmp(2));
++  Storage.files["/sleep.bmp.bak"] = bmp(3);
++  Storage.failRemove = "/sleep.bmp.bak";
++  pluginevents::drain(nullptr, 4);
++  assert(pluginhttp::sends == 0 && Storage.files["/sleep.bmp"] == bmp(1));
++  assert(Storage.files["/sleep.bmp.bak"] == bmp(3) && Storage.files[queuePath] == queued);
++
++  // Failed final cleanup leaves two usable files; next drain cleans safely.
++  setupDownload(checked, 200, bmp(2));
++  Storage.failRemove = "/sleep.bmp.bak";
++  pluginevents::drain(nullptr, 4);
++  assert(!Storage.exists(queuePath) && Storage.files["/sleep.bmp"] == bmp(2));
++  assert(Storage.files["/sleep.bmp.bak"] == bmp(1));
++  Storage.failRemove.clear();
++  Storage.files[queuePath] = queued;
++  pluginhttp::replyStatus = 500;
++  pluginevents::drain(nullptr, 4);
++  assert(!Storage.exists("/sleep.bmp.bak") && Storage.files["/sleep.bmp"] == bmp(2));
++
++  // Removing an invalid handler permits the existing queue cleanup.
++  setupDownload(",\"format\":null", 200, bmp(2));
++  Storage.files["/plugins/fixture/device.json"] = "{}";
++  pluginevents::drain(nullptr, 4);
++  assert(!Storage.exists(queuePath) && pluginhttp::sends == 0);
++}
+diff --git a/test/plugin_event_asset/run.py b/test/plugin_event_asset/run.py
+new file mode 100644
+index 00000000..b061af2c
+--- /dev/null
++++ b/test/plugin_event_asset/run.py
+@@ -0,0 +1,44 @@
++"""Run the real BMP helper/decoder and production event drain with SD/HTTP boundaries.
++
++Requires existing PlatformIO ArduinoJson dependencies; never installs packages.
++Set ARDUINOJSON_SRC to an existing ArduinoJson/src directory when host-only.
++The generated excerpts remove unrelated subscription/emit and HTTP transport
++code, not manifest parsing, delivery, queue handling, or vocabulary helpers.
++"""
++from pathlib import Path
++import os
++import subprocess
++import tempfile
++
++root = Path(__file__).resolve().parents[2]
++here = Path(__file__).resolve().parent
++arduinojson = Path(os.environ.get("ARDUINOJSON_SRC", root / ".pio/libdeps/x4pro/ArduinoJson/src"))
++if not (arduinojson / "ArduinoJson.h").is_file():
++    raise SystemExit("Existing ArduinoJson headers required; set ARDUINOJSON_SRC or prepare PlatformIO dependencies")
++events = (root / "src/util/PluginEvents.cpp").read_text()
++start = events.index("namespace {\n")
++end = events.index("}  // namespace\n", start) + len("}  // namespace\n")
++drain_start = events.index("namespace {\n\n// The manifest subset")
++assert events.count("bool loadDrainManifest(") == 1
++assert events.count("bool deliverLine(") == 1
++assert events.count("void drain(") == 1
++http = (root / "src/util/PluginHttp.cpp").read_text()
++http_start = http.index("namespace pluginhttp {\n")
++http_end = http.index("// A manifest may not point")
++with tempfile.TemporaryDirectory(prefix="plugin-event-asset-") as tmp:
++    tmp = Path(tmp)
++    (tmp / "WString.h").write_text("#pragma once\n#include <string>\nusing String = std::string;\n")
++    (tmp / "ProductionDrain.inc").write_text(events[start:end] + "\nnamespace pluginevents {\n" + events[drain_start:])
++    (tmp / "ProductionHttp.inc").write_text(http[http_start:http_end] + "\n}  // namespace pluginhttp\n")
++    binary = tmp / "check"
++    subprocess.run([
++        "c++", "-std=c++20", "-O0", "-g", "-fsanitize=address,undefined",
++        "-I", str(tmp), "-I", str(here / "stubs"), "-I", str(arduinojson),
++        "-I", str(root / "src"), "-I", str(root / "lib/GfxRenderer"), "-I", str(root / "lib/Memory"),
++        str(root / "src/util/PluginEventAsset.cpp"),
++        str(root / "lib/GfxRenderer/Bitmap.cpp"),
++        str(root / "lib/GfxRenderer/BitmapHelpers.cpp"),
++        str(here / "AssetTest.cpp"), "-o", str(binary),
++    ], check=True)
++    subprocess.run([str(binary)], check=True)
++print("Plugin event BMP helper/Bitmap and actual loadDrainManifest/deliverLine/drain host checks passed (ASan/UBSan)")
+diff --git a/test/plugin_event_asset/stubs/HalStorage.h b/test/plugin_event_asset/stubs/HalStorage.h
+new file mode 100644
+index 00000000..662a81ae
+--- /dev/null
++++ b/test/plugin_event_asset/stubs/HalStorage.h
+@@ -0,0 +1,68 @@
++#pragma once
++
++#include <cstdint>
++#include <string>
++#include <unordered_map>
++
++struct HalFile {
++  const std::string* data = nullptr;
++  size_t pos = 0;
++  explicit operator bool() const { return data != nullptr; }
++  bool seek(uint64_t offset) {
++    if (!data || offset > data->size()) return false;
++    pos = static_cast<size_t>(offset);
++    return true;
++  }
++  bool seekCur(int64_t offset) {
++    if (offset < 0 && static_cast<uint64_t>(-offset) > pos) return false;
++    return seek(pos + offset);
++  }
++  int read() { return !data || pos >= data->size() ? -1 : static_cast<unsigned char>((*data)[pos++]); }
++  size_t read(void* out, size_t count) {
++    auto* bytes = static_cast<unsigned char*>(out);
++    size_t n = 0;
++    while (n < count) {
++      const int c = read();
++      if (c < 0) break;
++      bytes[n++] = static_cast<unsigned char>(c);
++    }
++    return n;
++  }
++  uint64_t fileSize64() const { return data ? data->size() : 0; }
++};
++
++struct StorageStub {
++  std::unordered_map<std::string, std::string> files;
++  std::string failRenameFrom, failRenameTo, failRemove;
++  bool openFileForRead(const char*, const std::string& path, HalFile& out) {
++    const auto it = files.find(path);
++    if (it == files.end()) return false;
++    out.data = &it->second;
++    out.pos = 0;
++    return true;
++  }
++  bool readFileToString(const char*, const std::string& path, size_t cap, std::string& out) {
++    const auto it = files.find(path);
++    if (it == files.end() || it->second.size() > cap) return false;
++    out = it->second;
++    return true;
++  }
++  bool writeFile(const char* path, const std::string& value) {
++    files[path] = value;
++    return true;
++  }
++  bool exists(const char* path) const { return files.count(path) != 0; }
++  bool rename(const char* from, const char* to) {
++    if (failRenameFrom == from || failRenameTo == to || exists(to)) return false;
++    const auto it = files.find(from);
++    if (it == files.end()) return false;
++    files[to] = std::move(it->second);
++    files.erase(from);
++    return true;
++  }
++  bool remove(const char* path) {
++    if (failRemove == path) return false;
++    return files.erase(path) != 0;
++  }
++};
++inline StorageStub Storage;
+diff --git a/test/plugin_event_asset/stubs/Logging.h b/test/plugin_event_asset/stubs/Logging.h
+new file mode 100644
+index 00000000..ba557349
+--- /dev/null
++++ b/test/plugin_event_asset/stubs/Logging.h
+@@ -0,0 +1,3 @@
++#pragma once
++#define LOG_ERR(...) ((void)0)
++#define LOG_DBG(...) ((void)0)
