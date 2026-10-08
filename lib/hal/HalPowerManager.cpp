@@ -74,7 +74,7 @@ void HalPowerManager::setPowerSaving(bool enabled) {
   xSemaphoreGive(modeMutex);
 }
 
-void HalPowerManager::startDeepSleep(HalGPIO& gpio) const {
+void HalPowerManager::startDeepSleep(HalGPIO& gpio, uint64_t timerWakeUs) const {
 #if FREEINK_DEVICE_EEGO_A4
   // LM3630A and GSL share I2C; turn the light off before touch releases the bus.
   Frontlight.setOn(false);
@@ -149,6 +149,12 @@ void HalPowerManager::startDeepSleep(HalGPIO& gpio) const {
     freeink::metalio::powerOff();
   }
 #endif
+
+  // Add a one-shot timer without changing the board's shutdown or button wake.
+  // Timer wake requires the ESP to remain powered through sleep.
+  if (timerWakeUs > 0) {
+    esp_sleep_enable_timer_wakeup(timerWakeUs);
+  }
 
   // Waits for the power button to be physically released (so holding it doesn't
   // immediately wake the device again), then arms the wake source and sleeps.
