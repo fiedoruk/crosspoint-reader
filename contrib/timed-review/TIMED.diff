@@ -1,0 +1,2789 @@
+--- a/docs/plugin-events.md
++++ b/docs/plugin-events.md
+@@ -334,3 +334,82 @@
+ before synchronizing the clock or opening a socket. It does not enable verification
+ from a local build flag. The method and the SDK reference are proposals pending
+ upstream acceptance; this patch does not advance the SDK gitlink.
++
++## Timed sleep panels (dependent proposal)
++
++`sleep.timer` is a separate timer route, not an outbox event. It is never
++queued or replayed by an ordinary event drain. The proposed SDK
++capability above is required; older or unsupported SDKs cannot arm this route.
++This proposal is not yet available in an official CrossPoint release.
++
++A single subscribed plugin may provide this handler in `device.json`:
++
++```json
++{
++  "token": {"file": "token.json"},
++  "events": {
++    "sleep.timer": {
++      "interval_seconds": 900,
++      "download": {
++        "url": "https://example.test/frame",
++        "headers": {"Authorization": "Bearer {token}"},
++        "dest": "/sleep.bmp",
++        "format": "bmp",
++        "width": 480,
++        "height": 800,
++        "tls": {"ca_file": "certs/root.pem"}
++      }
++    }
++  }
++}
++```
++
++Dimensions must match the active board's default portrait axes; 480 by 800
++is the X4 Pro example, not a universal size. The interval must be an integer
++from 60 to 86400 seconds. The request must be HTTPS GET with an empty body,
++an explicit trust anchor, a nonempty saved token and a saved Wi-Fi network.
++Multiple timer owners, malformed configuration or missing prerequisites
++prevent arming. These interval bounds are prototype policy, not a measured
++battery-life or latency promise. Each successful clock sync may update the
++persisted time floor. At a 60-second cadence this can reach about 1,440 NVS
++updates per day; updates are not sector erases. Device qualification must
++measure energy, heap and NVS usage at the chosen cadence before release.
++
++The current caller enables the timer only for Sticky and X4 Pro; PaperMono is
++excluded pending PMIC/BOD evidence. At less than 20 percent battery, the
++reader returns to button-only sleep. A cycle has a separate 10-second Wi-Fi
++join window, then one cooperative 15-second budget for fresh time, fetch and
++authentication, with at most four HTTP attempts. Blocking DNS/TCP, storage
++and panel work can exceed these windows. Do not describe them as hard limits.
++
++A successful HTTP 200 is staged in `/sleep.bmp.part`. Header and length checks
++are followed by a full row decode into the existing framebuffer. Only then
++does the existing checked replacement promote the file and request one
++HALF_REFRESH. After a successful replacement, HALF_REFRESH completes before a captured
++Power press is handled. Failed fetch, validation or decode preserves the previous asset
++and requests no transfer. HTTP 204/304 is a failed replacement in this slice;
++there is no conditional-refresh contract. The 1 MiB download limit also applies:
++a 480 by 800 uncompressed 24-bit BMP is too large; use a compatible smaller
++palette such as 1-bit BW. The timer path projects the raster into BW without
++scaling or applying saved Custom orientation/grayscale preferences.
++
++A GPIO edge latch captures a Power press across blocking timer work. It uses
++the existing board pin/polarity through the HAL and is detached before normal
++input routing. If capture cannot be established, the autonomous work is
++skipped and the route returns to button-only sleep without initializing SD
++or the panel. This is not an unconditional guarantee of short-press capture.
++The shared GPIO ISR service keeps its existing interrupt flags; a new
++service uses normal interrupts, without a cache-off delivery guarantee. A
++captured press enters the existing click/hold and recovery path;
++a rejected short tap returns to standby without consuming a later held Power
++press during teardown. If deep-sleep entry returns after Power was captured, a one-shot RTC marker
++carries the press through a software restart into the manual path with
++peripherals initialized. Every boot clears the marker; only a software reset
++honors it. The final check-to-sleep interval still needs device qualification.
++This does not make the blocking I/O itself cancellable.
++
++The timer branch does not load or save book position, settings, reading history
++or reader outboxes. An offline or revoked grant may leave old pixels visible;
++include the content's timestamp in the image. Download or transfer completion
++is not proof that a person saw the screen. Device pixels, energy, runtime heap
++and the complete supported-model matrix require separate hardware acceptance.
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -299,6 +299,7 @@
+ STR_EVENT_READING_SESSION: "reading sessions"
+ STR_EVENT_DOWNLOAD: "downloads"
+ STR_EVENT_SLEEP: "sleep and current book"
++STR_EVENT_TIMER: "timed sleep refresh"
+ STR_LOAN_EXPIRED: "This loan has expired. Borrow or renew the book to keep reading."
+ STR_LOAN_TIME_UNVERIFIED: "This book is on loan. Connect to Wi-Fi once so the device can check the date."
+ STR_DRM_PROTECTED_FILE: "DRM-protected file"
+--- a/lib/hal/HalGPIO.cpp
++++ b/lib/hal/HalGPIO.cpp
+@@ -5,6 +5,7 @@
+ #include <Preferences.h>
+ #include <SPI.h>
+ #include <XteinkDetect.h>
++#include <driver/gpio.h>
+ #include <esp_sleep.h>
+ 
+ // Global HalGPIO instance
+@@ -195,6 +196,69 @@
+   return BoardConfig::ACTIVE.board == BoardConfig::Board::XteinkX3 ||
+          BoardConfig::ACTIVE.board == BoardConfig::Board::XteinkX3Uc8279 ||
+          BoardConfig::ACTIVE.board == BoardConfig::Board::XteinkX4;
++}
++
++bool HalGPIO::rawPowerButtonPressed() const { return inputMgr.isPowerButtonPhysicallyPressed(); }
++
++void IRAM_ATTR HalGPIO::capturePowerPress(void* context) {
++  auto* instance = static_cast<HalGPIO*>(context);
++  portENTER_CRITICAL_ISR(&instance->powerCaptureMux);
++  instance->capturedPowerPress = true;
++  portEXIT_CRITICAL_ISR(&instance->powerCaptureMux);
++}
++
++bool HalGPIO::beginPowerPressCapture() {
++  endPowerPressCapture();
++  if (!(BoardConfig::isSticky() || BoardConfig::isX4Pro()) || BoardConfig::ACTIVE.input.power < 0) return false;
++  const bool pressed = rawPowerButtonPressed();
++  portENTER_CRITICAL(&powerCaptureMux);
++  capturedPowerPress = pressed;
++  portEXIT_CRITICAL(&powerCaptureMux);
++  const auto pin = static_cast<gpio_num_t>(BoardConfig::ACTIVE.input.power);
++  // Keep the shared service compatible with Arduino callbacks in flash.
++  const auto installed = gpio_install_isr_service(0);
++  if (installed != ESP_OK && installed != ESP_ERR_INVALID_STATE) {
++    LOG_ERR("GPIO", "Power capture service failed: %d", static_cast<int>(installed));
++    return false;
++  }
++  const auto edge = BoardConfig::ACTIVE.input.powerActiveHigh ? GPIO_INTR_POSEDGE : GPIO_INTR_NEGEDGE;
++  const auto configured = gpio_set_intr_type(pin, edge);
++  if (configured != ESP_OK) {
++    LOG_ERR("GPIO", "Power capture edge failed: %d", static_cast<int>(configured));
++    return false;
++  }
++  const auto attached = gpio_isr_handler_add(pin, capturePowerPress, this);
++  if (attached != ESP_OK) {
++    gpio_intr_disable(pin);
++    LOG_ERR("GPIO", "Power capture attach failed: %d", static_cast<int>(attached));
++    return false;
++  }
++  capturedPowerPin = static_cast<int8_t>(pin);
++  if (rawPowerButtonPressed()) {
++    portENTER_CRITICAL(&powerCaptureMux);
++    capturedPowerPress = true;
++    portEXIT_CRITICAL(&powerCaptureMux);
++  }
++  return true;
++}
++
++bool HalGPIO::powerPressCaptured() const {
++  portENTER_CRITICAL(&powerCaptureMux);
++  const bool captured = capturedPowerPress;
++  portEXIT_CRITICAL(&powerCaptureMux);
++  return captured || rawPowerButtonPressed();
++}
++
++void HalGPIO::endPowerPressCapture() {
++  if (capturedPowerPin >= 0) {
++    const auto pin = static_cast<gpio_num_t>(capturedPowerPin);
++    gpio_intr_disable(pin);
++    gpio_isr_handler_remove(pin);
++    capturedPowerPin = -1;
++  }
++  portENTER_CRITICAL(&powerCaptureMux);
++  capturedPowerPress = false;
++  portEXIT_CRITICAL(&powerCaptureMux);
+ }
+ 
+ bool HalGPIO::verifyPowerButtonWakeup() {
+--- a/lib/hal/HalGPIO.h
++++ b/lib/hal/HalGPIO.h
+@@ -2,6 +2,7 @@
+ 
+ #include <Arduino.h>
+ #include <InputManager.h>
++#include <freertos/FreeRTOS.h>
+ 
+ #include "WakeupClassify.h"
+ 
+@@ -45,6 +46,11 @@
+   InputManager inputMgr;
+ #endif
+ 
++  bool capturedPowerPress = false;
++  mutable portMUX_TYPE powerCaptureMux = portMUX_INITIALIZER_UNLOCKED;
++  int8_t capturedPowerPin = -1;
++  static void IRAM_ATTR capturePowerPress(void* context);
++
+   bool lastUsbConnected = false;
+   bool usbStateChanged = false;
+   uint8_t previousCapacitivePageButtons = 0;
+@@ -87,6 +93,11 @@
+   // hardware (ADC ladder off its idle rail, or the power GPIO asserted), without
+   // going through the debounced state. Cheap enough to call every few ms.
+   bool rawInputActive();
++  bool rawPowerButtonPressed() const;
++  // Capture a press across blocking timer I/O; stop before normal input routing.
++  bool beginPowerPressCapture();
++  bool powerPressCaptured() const;
++  void endPowerPressCapture();
+   bool hasTouch() const;
+   // Capacitive Home key reported by the touch controller (X4 Pro). The tap
+   // event fires on release and excludes a long hold.
+--- a/lib/hal/HalPowerManager.cpp
++++ b/lib/hal/HalPowerManager.cpp
+@@ -11,6 +11,7 @@
+ #include <cassert>
+ 
+ #include "HalGPIO.h"
++#include "TimerWakeArm.h"
+ 
+ #if FREEINK_DEVICE_EEGO_A4
+ #include <HalFrontlight.h>
+@@ -75,23 +76,8 @@
+   xSemaphoreGive(modeMutex);
+ }
+ 
+-void HalPowerManager::startDeepSleep(HalGPIO& gpio, uint64_t timerWakeUs) const {
+-  bool timerWakeArmed = false;
+-  if (timerWakeUs > 0) {
+-    const auto result = esp_sleep_enable_timer_wakeup(timerWakeUs);
+-    if (result == ESP_OK) {
+-      timerWakeArmed = true;
+-    } else {
+-      LOG_ERR("PWR", "Timer wake arming failed: %d", static_cast<int>(result));
+-      const auto disabled = esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+-      if (disabled != ESP_OK && disabled != ESP_ERR_INVALID_STATE) {
+-        // Do not sleep with a wake source whose state could not be cleared.
+-        LOG_ERR("PWR", "Timer wake disable failed: %d; restarting", static_cast<int>(disabled));
+-        esp_restart();
+-      }
+-    }
+-  }
+-
++void HalPowerManager::startDeepSleep(HalGPIO& gpio, uint64_t timerWakeUs, bool fromTimerWake) const {
++  const bool timerWakeArmed = timerwakearm::arm(timerWakeUs);
+ #if FREEINK_DEVICE_EEGO_A4
+   // LM3630A and GSL share I2C; turn the light off before touch releases the bus.
+   Frontlight.setOn(false);
+@@ -170,9 +156,9 @@
+   }
+ #endif
+ 
+-  // Waits for the power button to be physically released (so holding it doesn't
+-  // immediately wake the device again), then arms the wake source and sleeps.
+-  freeink::PowerManager::deepSleepUntilPowerButton();
++  // A captured tap after teardown needs a fresh boot before reader setup.
++  if (fromTimerWake && gpio.powerPressCaptured()) return;
++  timerwakearm::sleep(fromTimerWake);
+ }
+ 
+ uint16_t HalPowerManager::getBatteryPercentage() const {
+--- a/lib/hal/HalPowerManager.h
++++ b/lib/hal/HalPowerManager.h
+@@ -40,11 +40,11 @@
+ 
+   // Setup wake up GPIO and enter deep sleep
+   // Should be called inside main loop() to handle the currentLockMode
+-  //
+-  // timerWakeUs requests an ESP-IDF one-shot timer in microseconds; zero adds
+-  // no timer. Existing board shutdown and button-wake behavior is unchanged.
+-  // Timer wake requires ESP power through sleep and an IDF-accepted duration.
+-  void startDeepSleep(HalGPIO& gpio, uint64_t timerWakeUs = 0) const;
++  // A nonzero interval requests a one-shot timer on qualified powered models.
++  // Zero or failed arming restores button-only sleep.
++  // fromTimerWake skips release-wait; a captured tap returns after teardown
++  // so the caller can restart into the manual wake path.
++  void startDeepSleep(HalGPIO& gpio, uint64_t timerWakeUs = 0, bool fromTimerWake = false) const;
+ 
+   // Get battery percentage (range 0-100)
+   uint16_t getBatteryPercentage() const;
+--- /dev/null
++++ b/lib/hal/TimerWakeArm.h
+@@ -0,0 +1,43 @@
++#pragma once
++
++#include <Logging.h>
++#include <PowerManager.h>
++#include <esp_sleep.h>
++#include <esp_system.h>
++
++#include <cstdint>
++
++namespace timerwakearm {
++// Wake sources survive wakeup; zero must explicitly restore button-only sleep.
++inline void clearTimer() {
++  const auto disabled = esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
++  if (disabled != ESP_OK && disabled != ESP_ERR_INVALID_STATE) {
++    // Do not sleep with a wake source whose state could not be cleared.
++    LOG_ERR("PWR", "Timer wake disable failed: %d; restarting", static_cast<int>(disabled));
++    esp_restart();
++  }
++}
++
++// Rejected timer requests fall back to button-only sleep.
++inline bool arm(const uint64_t intervalUs) {
++  if (intervalUs == 0) {
++    clearTimer();
++    return false;
++  }
++  const auto result = esp_sleep_enable_timer_wakeup(intervalUs);
++  if (result == ESP_OK) return true;
++  LOG_ERR("PWR", "Timer wake arming failed: %d", static_cast<int>(result));
++  clearTimer();
++  return false;
++}
++inline void sleep(const bool fromTimerWake) {
++  if (fromTimerWake) {
++    // A button arriving during timer teardown must wake us, not be consumed by
++    // waitForPowerButtonRelease(). A sleep abort restarts through the SDK.
++    freeink::PowerManager::armPowerButtonWakeup();
++    freeink::PowerManager::deepSleep();
++  } else {
++    freeink::PowerManager::deepSleepUntilPowerButton();
++  }
++}
++}  // namespace timerwakearm
+--- a/src/activities/plugins/PluginCatalogActivity.cpp
++++ b/src/activities/plugins/PluginCatalogActivity.cpp
+@@ -314,9 +314,9 @@
+   // Disclose which device events each plugin receives (and so what reading
+   // activity it can send off the device). The list leads the subtitle so the
+   // two-line wrap never cuts it.
+-  static constexpr StrId EVENT_LABELS[] = {StrId::STR_EVENT_BOOK_OPEN, StrId::STR_EVENT_BOOK_CLOSE,
++  static constexpr StrId EVENT_LABELS[] = {StrId::STR_EVENT_BOOK_OPEN,       StrId::STR_EVENT_BOOK_CLOSE,
+                                            StrId::STR_EVENT_READING_SESSION, StrId::STR_EVENT_DOWNLOAD,
+-                                           StrId::STR_EVENT_SLEEP};
++                                           StrId::STR_EVENT_SLEEP,           StrId::STR_EVENT_TIMER};
+   static_assert(sizeof(EVENT_LABELS) / sizeof(EVENT_LABELS[0]) == static_cast<size_t>(pluginevents::Event::COUNT));
+   for (auto& plugin : installedPlugins) {
+     const uint8_t mask = pluginevents::subscriptionMask(plugin.name.c_str());
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -23,6 +23,7 @@
+ #include <builtinFonts/all.h>
+ 
+ #include <cstring>
++#include <functional>
+ 
+ #include "CrossPointSettings.h"
+ #include "CrossPointState.h"
+@@ -39,8 +40,11 @@
+ #include "fontIds.h"
+ #include "platform/UsbSerialJtagHandoff.h"
+ #include "util/ButtonNavigator.h"
++#include "util/PluginDrainBudget.h"
+ #include "util/PluginEvents.h"
+ #include "util/ScreenshotUtil.h"
++#include "util/TimedSleepPaint.h"
++#include "util/TimedWakeGuard.h"
+ #include "util/Timezones.h"
+ 
+ #if CROSSPOINT_VECTOR_FONTS
+@@ -335,6 +339,8 @@
+ }
+ 
+ // Enter deep sleep mode
++static uint64_t prepareTimerPanel();
++
+ void enterDeepSleep(bool fromTimeout = false) {
+   HalPowerManager::Lock powerLock;  // Ensure we are at normal CPU frequency for sleep preparation
+   APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
+@@ -374,19 +380,29 @@
+     WiFi.mode(WIFI_OFF);
+   }
+ 
++  const uint64_t timerInterval =
++      (BoardConfig::isSticky() || BoardConfig::isX4Pro()) && powerManager.getBatteryPercentage() >= 20
++          ? prepareTimerPanel()
++          : 0;
++  pluginevents::discardTimed();
+   halTiltSensor.deepSleep();
+   display.deepSleep();
+   Storage.prepareForDeepSleep();
+   LOG_DBG("MAIN", "Entering deep sleep");
+ 
+-  powerManager.startDeepSleep(gpio);
+-}
+-
+-void setupDisplayAndFonts(bool seamless = false) {
++  powerManager.startDeepSleep(gpio, timerInterval);
++}
++
++RTC_NOINIT_ATTR uint32_t timerManualWakeStamp;
++static bool timerStorageReady = false;
++static bool timerDisplayReady = false;
++static bool timerDisplayStarted = false;
++
++static void setupBitmapDisplay(bool seamless) {
++  if (timerDisplayReady) return;
+ #if !FREEINK_MCU_C3
+   // C3 resolves its controller in HalGPIO::begin() before SPI claims the
+-  // display pins. X4 Pro skips that C3-only path, so probe here before
+-  // display.begin() selects and initializes its panel driver.
++  // display pins. X4 Pro probes before display.begin().
+   static bool controllerResolved = false;
+   if (!controllerResolved) {
+     controllerResolved = true;
+@@ -395,9 +411,15 @@
+     }
+   }
+ #endif
+-
++  timerDisplayStarted = true;
+   display.begin(seamless);
++  if (!display.getFrameBuffer()) return;
+   renderer.begin();
++  timerDisplayReady = true;
++}
++
++void setupDisplayAndFonts(bool seamless = false) {
++  setupBitmapDisplay(seamless);
+   activityManager.begin();
+   LOG_DBG("MAIN", "Display initialized");
+ 
+@@ -426,6 +448,87 @@
+   sdFontSystem.begin(renderer);
+ 
+   LOG_DBG("MAIN", "Fonts setup");
++}
++
++// Read cadence and credentials before the first ordinary sleep and on every
++// autonomous wake. Snapshot one handler/grant/config, never a reader outbox.
++static uint64_t prepareTimerPanel() {
++  pluginevents::discardTimed();
++  if (!timerStorageReady) timerStorageReady = Storage.ready() || Storage.begin();
++  if (!timerStorageReady) return 0;
++  pluginevents::refreshSubscriptions();
++  const uint64_t interval =
++      pluginevents::prepareTimed(BoardConfig::ACTIVE.displayHeight, BoardConfig::ACTIVE.displayWidth);
++  if (!interval) return 0;
++  WIFI_STORE.loadFromFile();
++  const auto cred = WIFI_STORE.findCredential(WIFI_STORE.getLastConnectedSsid());
++  if (!cred || cred->ssid.empty()) {
++    pluginevents::discardTimed();
++    return 0;
++  }
++  return interval;
++}
++
++// Qualified runtime Timer only, before reader/settings/activity loading. The
++// contract is default Portrait and BW projection, not saved Custom preferences.
++static bool syncTimerPanel() {
++  bool manualPower = false;
++  const std::function<bool()> abort = [&] {
++    manualPower = manualPower || gpio.powerPressCaptured();
++    return manualPower;
++  };
++  if (abort()) {
++    pluginevents::discardTimed();
++    return true;
++  }
++  halClock.begin();
++  trustedtime::init();
++  const auto cred = WIFI_STORE.findCredential(WIFI_STORE.getLastConnectedSsid());
++  if (!cred || cred->ssid.empty() || abort()) {
++    pluginevents::discardTimed();
++    return manualPower;
++  }
++  WiFi.mode(WIFI_STA);
++  WiFi.begin(cred->ssid.c_str(), cred->password.c_str());
++  const uint32_t joinedAt = millis();
++  while (WiFi.status() != WL_CONNECTED && static_cast<uint32_t>(millis() - joinedAt) < 10000 && !abort()) {
++    delay(100);
++  }
++  if (WiFi.status() == WL_CONNECTED && !abort()) {
++    // The join window is separate; fresh time, fetch and auth share this attempt.
++    pluginevents::DrainBudget budget(4, 15000, []() -> uint32_t { return static_cast<uint32_t>(millis()); });
++    const std::function<bool()> attemptAbort = [&] { return abort() || !budget.timeAvailable(); };
++    if (trustedtime::syncFresh(10000, attemptAbort) && trustedtime::hasFreshSync() && !attemptAbort()) {
++      const auto result = pluginevents::timedSync(budget, attemptAbort);
++      if (result.state == pluginevents::TimedState::Staged) {
++        if (powerManager.getBatteryPercentage() >= 20 && !attemptAbort()) {
++          setupBitmapDisplay(false);
++          if (timerDisplayReady && !attemptAbort()) timedsleeppaint::paint(renderer, result.asset, attemptAbort);
++        }
++        Storage.remove((result.asset + ".part").c_str());
++      }
++    }
++  }
++  WiFi.disconnect(true);
++  WiFi.mode(WIFI_OFF);
++  pluginevents::discardTimed();
++  abort();  // Latch a short button tap observed before returning to the guard.
++  return manualPower;
++}
++
++// A rejected short Power tap on a timer wake returns to the configured
++// standby cadence after cleaning up any panel initialized by this cycle.
++static void returnToTimerStandby() {
++  const bool captureReady = gpio.beginPowerPressCapture();
++  const uint64_t interval = captureReady && powerManager.getBatteryPercentage() >= 20 ? prepareTimerPanel() : 0;
++  pluginevents::discardTimed();
++  Frontlight.setOn(false);
++  halTiltSensor.deepSleep();
++  if (timerDisplayStarted) display.deepSleep();
++  Storage.prepareForDeepSleep();
++  powerManager.startDeepSleep(gpio, interval, true);
++  if (gpio.powerPressCaptured()) timerManualWakeStamp = timedwake::MANUAL_WAKE_STAMP;
++  ESP.restart();  // Unexpected return cannot enter reader setup.
+ }
+ 
+ void setup() {
+@@ -447,6 +550,8 @@
+   // checkPanic() clears the watchdog capture marker after a successful SD
+   // dump, so retain the boot classification for the later activity route.
+   const bool rebootedFromPanic = HalSystem::isRebootFromPanic();
++  const auto resetReason = esp_reset_reason();
++  const bool resumedTimerPower = timedwake::consumeManualWake(resetReason, timerManualWakeStamp);
+ 
+   // Read-and-clear so a panic later in setup() doesn't loop into silent reboot.
+   // Bound the target range too — RTC_NOINIT memory is uninitialized on cold boot.
+@@ -461,19 +566,53 @@
+   gpio.begin();
+   powerManager.begin();
+ 
+-  const auto wakeupReason = gpio.getWakeupReason();
++  const auto wakeupReason = resumedTimerPower ? HalGPIO::WakeupReason::PowerButton : gpio.getWakeupReason();
++  const bool timerPowerCaptureReady = wakeupReason != HalGPIO::WakeupReason::Timer ||
++                                      !(BoardConfig::isSticky() || BoardConfig::isX4Pro()) ||
++                                      gpio.beginPowerPressCapture();
++  struct TimerBootHooks {
++    bool manualPower = false;
++    bool powerPressed() {
++      manualPower = manualPower || gpio.powerPressCaptured();
++      return manualPower;
++    }
++    uint16_t batteryPercent() const { return powerManager.getBatteryPercentage(); }
++    uint64_t prepare() { return prepareTimerPanel(); }
++    void sync() { manualPower = syncTimerPanel(); }
++    void sleep(const uint64_t intervalUs) const {
++      pluginevents::discardTimed();
++      // No activity transition or reader state write. Failed/absent fetch and
++      // failed decode do not transfer a new framebuffer to the panel.
++      if (timerDisplayStarted) display.deepSleep();
++      if (timerStorageReady) Storage.prepareForDeepSleep();
++      deepSleepInProgress = true;
++      powerManager.startDeepSleep(gpio, intervalUs, true);
++      if (gpio.powerPressCaptured()) timerManualWakeStamp = timedwake::MANUAL_WAKE_STAMP;
++      ESP.restart();  // Unexpected return uses an ordinary SW boot, never Timer.
++    }
++  } timerHooks;
++  if (timedwake::handleBoot({wakeupReason, resetReason, BoardConfig::isSticky() || BoardConfig::isX4Pro(),
++                             isSilentReboot || rebootedFromPanic || !timerPowerCaptureReady},
++                            timerHooks)) {
++    return;
++  }
++  gpio.endPowerPressCapture();
++  pluginevents::discardTimed();  // Power/manual boot must never retain the autonomous attempt.
+   // Sample the wake hold now — a click wake is released within milliseconds of
+   // boot — but defer the sleep-or-boot decision until SETTINGS is loaded below:
+   // click-to-wake is a setting, and an X4 battery power-off cuts all power, so
+   // only SD state survives to the next boot.
+-  const bool wakeHoldVerified = wakeupReason != HalGPIO::WakeupReason::PowerButton || gpio.verifyPowerButtonWakeup();
++  const bool manualTimerWake =
++      resumedTimerPower || (wakeupReason == HalGPIO::WakeupReason::Timer && timerHooks.manualPower);
++  const bool powerWake = wakeupReason == HalGPIO::WakeupReason::PowerButton || manualTimerWake;
++  const bool wakeHoldVerified = !powerWake || gpio.verifyPowerButtonWakeup();
+ 
+   // X4 Pro and X4 Classic both map BTN_UP to GPIO0 — an ESP32-S3 boot strap — so
+   // gate recovery on the non-strap Down key (GPIO7) to avoid a stuck-in-recovery loop.
+   const auto recoveryButton = (BoardConfig::isX4Pro() || BoardConfig::isX4Classic()) ? MappedInputManager::Button::Down
+                                                                                      : MappedInputManager::Button::Up;
+-  const bool recoveryFirmwareMode = wakeupReason == HalGPIO::WakeupReason::PowerButton && !BoardConfig::isPaperMono() &&
+-                                    mappedInputManager.isPressed(recoveryButton);
++  const bool recoveryFirmwareMode =
++      powerWake && !BoardConfig::isPaperMono() && mappedInputManager.isPressed(recoveryButton);
+ 
+   halTiltSensor.begin();
+   halClock.begin();
+@@ -486,7 +625,7 @@
+ 
+   // SD Card Initialization
+   // We need 6 open files concurrently when parsing a new chapter
+-  if (!Storage.begin()) {
++  if (!timerStorageReady && !Storage.begin()) {
+     LOG_ERR("MAIN", "SD card initialization failed");
+     setupDisplayAndFonts(isSilentReboot);
+     activityManager.goToFullScreenMessage("SD card error", EpdFontFamily::BOLD);
+@@ -496,7 +635,7 @@
+   HalSystem::checkPanic();
+ 
+   APP_STATE.loadFromFile();
+-  const bool isSleepWake = wakeupReason == HalGPIO::WakeupReason::PowerButton;
++  const bool isSleepWake = powerWake;
+   const bool isPersistedSleepWake = isSleepWake && !APP_STATE.showBootScreen;
+ 
+   if (recoveryFirmwareMode) {
+@@ -536,19 +675,18 @@
+ 
+   switch (wakeupReason) {
+     case HalGPIO::WakeupReason::PowerButton:
++    case HalGPIO::WakeupReason::Timer:
++      if (!powerWake) break;
+       // With Short Power Button Press = Sleep, a single click wakes on any
+       // device; otherwise the button must still be held (ghost-wake debounce).
+-      if (!wakeHoldVerified && SETTINGS.shortPwrBtn != CrossPointSettings::SHORT_PWRBTN::SLEEP) {
++      if (!timedwake::acceptManualWake(wakeHoldVerified,
++                                       SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::SLEEP)) {
+         LOG_DBG("MAIN", "Power-button wake not held through verification, sleeping");
++        if (manualTimerWake) returnToTimerStandby();
+         Storage.prepareForDeepSleep();
+         powerManager.startDeepSleep(gpio);
+       }
+       wakePowerReleasePending = true;
+-      break;
+-    case HalGPIO::WakeupReason::Timer:
+-      // A timer wake is classified information only: it boots normally like
+-      // any non-power-button wake until a consumer is added.
+-      LOG_DBG("MAIN", "Wakeup reason: Timer");
+       break;
+     case HalGPIO::WakeupReason::AfterUSBPower:
+       // Most devices return to sleep after a USB-powered cold boot.
+--- a/src/util/PluginEvents.cpp
++++ b/src/util/PluginEvents.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include <cstdio>
+ #include <cstring>
++#include <optional>
+ #include <string>
+ #include <vector>
+ 
+@@ -23,8 +24,8 @@
+ 
+ namespace {
+ 
+-constexpr const char* EVENT_NAMES[] = {"reader.open", "reader.exit", "reader.session", "book.downloaded",
+-                                       "sleep.enter"};
++constexpr const char* EVENT_NAMES[] = {"reader.open",     "reader.exit", "reader.session",
++                                       "book.downloaded", "sleep.enter", "sleep.timer"};
+ static_assert(sizeof(EVENT_NAMES) / sizeof(EVENT_NAMES[0]) == static_cast<size_t>(pluginevents::Event::COUNT),
+               "event name table out of sync");
+ 
+@@ -49,6 +50,7 @@
+   uint8_t connectMask = 0;  // events whose handler declares "connect": true
+ };
+ Subscriber subscribers[MAX_EVENT_PLUGINS];
++bool timerDiscoveryComplete = true;
+ 
+ uint8_t eventBit(const pluginevents::Event e) { return static_cast<uint8_t>(1u << static_cast<uint8_t>(e)); }
+ 
+@@ -66,6 +68,8 @@
+ namespace pluginevents {
+ 
+ void refreshSubscriptions() {
++  discardTimed();
++  timerDiscoveryComplete = true;
+   for (auto& sub : subscribers) sub = Subscriber{};
+ 
+   size_t slot = 0;
+@@ -73,22 +77,30 @@
+     if (!entry.hasDevice) continue;
+     if (slot >= MAX_EVENT_PLUGINS) {
+       LOG_ERR("PEVT", "subscription table full; ignoring %s", entry.name.c_str());
++      timerDiscoveryComplete = false;
+       break;
+     }
+     // The fixed-size table cannot hold these: a truncated name or folder would
+     // point emit() and drain() at a different outbox than the plugin's own.
+     if (entry.name.size() >= sizeof(Subscriber::name) || entry.dir.size() >= sizeof(Subscriber::dir)) {
+       LOG_ERR("PEVT", "plugin name/path too long for events; ignoring %s", entry.name.c_str());
++      timerDiscoveryComplete = false;
+       continue;
+     }
+     std::string raw;
+-    if (!Storage.readFileToString("PEVT", entry.dir + "/device.json", MAX_MANIFEST_SIZE, raw)) continue;
++    if (!Storage.readFileToString("PEVT", entry.dir + "/device.json", MAX_MANIFEST_SIZE, raw)) {
++      timerDiscoveryComplete = false;
++      continue;
++    }
+     // Filtered parse: only the events section, so a big manifest costs a few
+     // hundred bytes here instead of a full document.
+     JsonDocument filter;
+     filter["events"] = true;
+     JsonDocument doc;
+-    if (deserializeJson(doc, raw, DeserializationOption::Filter(filter)) != DeserializationError::Ok) continue;
++    if (deserializeJson(doc, raw, DeserializationOption::Filter(filter)) != DeserializationError::Ok) {
++      timerDiscoveryComplete = false;
++      continue;
++    }
+     uint8_t mask = 0;
+     uint8_t connectMask = 0;
+     for (JsonPairConst kv : doc["events"].as<JsonObjectConst>()) {
+@@ -98,7 +110,8 @@
+         continue;
+       }
+       mask |= static_cast<uint8_t>(1u << e);
+-      if (kv.value()["connect"] | false) connectMask |= static_cast<uint8_t>(1u << e);
++      if (e != static_cast<int>(Event::SleepTimer) && (kv.value()["connect"] | false))
++        connectMask |= static_cast<uint8_t>(1u << e);
+     }
+     // sleep.enter exists to act before the chip powers down (sleep image,
+     // pre-sleep sync), so subscribing implies "connect": true; requiring the
+@@ -145,7 +158,7 @@
+ }
+ 
+ void emit(const Event e, const Var* vars, const size_t varCount) {
+-  if (!anySubscriber(e)) return;
++  if (e == Event::SleepTimer || !anySubscriber(e)) return;
+ 
+   // One line: {"e":"reader.exit","id":"3fa9c21b-7","ts":1734212345,"vars":{"book":"...","percent":"74"}}
+   JsonDocument doc;
+@@ -222,6 +235,7 @@
+     std::string dest;
+     bool checkedBmp = false, invalidFormat = false;
+     int width = 0, height = 0;
++    uint32_t intervalSeconds = 0;
+     bool isDownload() const { return !dest.empty(); }
+   };
+   std::vector<Handler> handlers;
+@@ -259,6 +273,11 @@
+     if (e < 0) continue;
+     DrainManifest::Handler h;
+     h.event = e;
++    const JsonVariantConst cadence = kv.value()["interval_seconds"];
++    if (e == static_cast<int>(Event::SleepTimer) && cadence.is<uint32_t>()) {
++      const uint32_t seconds = cadence.as<uint32_t>();
++      if (seconds >= 60 && seconds <= 86400) h.intervalSeconds = seconds;
++    }
+     JsonVariantConst dl = kv.value()["download"];
+     if (dl["url"].as<const char*>()) {
+       pluginhttp::readRequest(dl, "GET", h.req);
+@@ -314,6 +333,7 @@
+   JsonDocument doc;
+   if (deserializeJson(doc, lineText) != DeserializationError::Ok) return true;  // corrupt line: drop
+   const int e = eventFromName(doc["e"] | "");
++  if (e == static_cast<int>(Event::SleepTimer)) return true;  // Never replay timer triggers.
+   const DrainManifest::Handler* handler = nullptr;
+   for (const auto& h : mf.handlers) {
+     if (h.event == e) {
+@@ -459,7 +479,125 @@
+   return true;
+ }
+ 
++// A single owner of /sleep.bmp avoids plugin-order-dependent panel writes.
++// Count declarations before qualification: an invalid second timer handler
++// must not silently select the first one. The generic subscription cap remains.
++enum class TimerSelection { None, Invalid, Ready };
++TimerSelection selectTimer(const int width, const int height, DrainManifest& selected, size_t& handlerIndex) {
++  if (!timerDiscoveryComplete) return TimerSelection::Invalid;
++  bool found = false;
++  for (const auto& sub : subscribers) {
++    if (sub.name[0] == '\0' || !(sub.mask & eventBit(Event::SleepTimer))) continue;
++    if (found) return TimerSelection::Invalid;
++    found = true;
++    if (!loadDrainManifest(sub, selected)) return TimerSelection::Invalid;
++    bool qualified = false;
++    for (size_t i = 0; i < selected.handlers.size(); ++i) {
++      const auto& h = selected.handlers[i];
++      if (h.event != static_cast<int>(Event::SleepTimer)) continue;
++      if (!h.intervalSeconds || !h.verified || h.caFile.empty() || h.req.url.compare(0, 8, "https://") != 0 ||
++          h.req.method != "GET" || !h.req.body.empty() || h.dest != "/sleep.bmp" || !h.checkedBmp || h.invalidFormat ||
++          h.width != width || h.height != height || width <= 0 || height <= 0)
++        return TimerSelection::Invalid;
++      handlerIndex = i;
++      qualified = true;
++      break;
++    }
++    if (!qualified) return TimerSelection::Invalid;
++  }
++  return found ? TimerSelection::Ready : TimerSelection::None;
++}
++
++struct PreparedTimer {
++  DrainManifest manifest;
++  size_t index = 0;
++  std::string token;
++  pluginhttp::Headers config;
++};
++std::optional<PreparedTimer> preparedTimer;
++TimedState preparedFailure = TimedState::NoHandler;
++
++void clearPreparedTimer() {
++  preparedTimer.reset();
++  preparedFailure = TimedState::NoHandler;
++}
+ }  // namespace
++
++void discardTimed() { clearPreparedTimer(); }
++
++uint64_t prepareTimed(const int width, const int height) {
++  clearPreparedTimer();
++  preparedFailure = TimedState::Failure;
++  PreparedTimer attempt;
++  const auto selection = selectTimer(width, height, attempt.manifest, attempt.index);
++  if (selection == TimerSelection::None) preparedFailure = TimedState::NoHandler;
++  if (selection != TimerSelection::Ready) return 0;
++  if (!pluginhttp::peerVerificationAvailable()) return 0;
++  auto& mf = attempt.manifest;
++  const auto& handler = mf.handlers[attempt.index];
++  if (!pluginhttp::hasLoadableTrustAnchor({mf.pluginDir, handler.caFile}) || mf.tokenFile.empty() ||
++      !pluginhttp::loadTokenFromFile(mf.tokenFile, mf.tokenPath, attempt.token) || attempt.token.empty())
++    return 0;
++  pluginhttp::loadConfigFile(mf.configFile, attempt.config);
++  for (auto& kv : attempt.config) kv.first = "{cfg." + kv.first + "}";
++  const uint64_t interval = static_cast<uint64_t>(handler.intervalSeconds) * 1000000ULL;
++  preparedTimer = std::move(attempt);
++  return interval;
++}
++
++TimedResult timedSync(DrainBudget& budget, const std::function<bool()>& shouldAbort) {
++  if (!preparedTimer) return {preparedFailure, {}};
++  PreparedTimer attempt = std::move(*preparedTimer);
++  clearPreparedTimer();  // Consume once, including every failure and Power abort.
++  auto& mf = attempt.manifest;
++  const auto& handler = mf.handlers[attempt.index];
++  auto& token = attempt.token;
++  auto& config = attempt.config;
++  const std::function<bool()> abort = [&] { return !budget.timeAvailable() || (shouldAbort && shouldAbort()); };
++  if (abort()) return {};
++  // Fresh id and time; there is deliberately no book, meta, reader or outbox.
++  char id[24];
++  snprintf(id, sizeof(id), "%08lx-timer", static_cast<unsigned long>(esp_random()));
++  const auto ts = static_cast<long long>(time(nullptr));
++  const auto substitute = [&](const std::string& text) {
++    return drainSubstituted(text, token, config, {}, JsonVariantConst{}, ts, id);
++  };
++  const auto headersFor = [&](const pluginhttp::Headers& source) {
++    pluginhttp::Headers headers;
++    headers.reserve(source.size());
++    for (const auto& h : source) headers.emplace_back(h.first, substitute(h.second));
++    return headers;
++  };
++  const std::string dest = handler.dest;
++  const std::string tmp = dest + ".part";
++  if (abort() || !plugineventasset::recover(dest)) return {};
++  const pluginhttp::VerifiedTrust trust{mf.pluginDir, handler.caFile};
++  const auto fetch = [&] {
++    if (abort() || !budget.beginAttempt()) return -1;
++    return pluginhttp::requestToFile(nullptr, substitute(handler.req.url), "GET", "", headersFor(handler.req.headers),
++                                     tmp.c_str(), 1024 * 1024, abort, &trust);
++  };
++  int status = fetch();
++  if ((status == 401 || status == 403) && mf.hasPasswordGrant() && mf.authVerified && !abort() &&
++      budget.beginAttempt()) {
++    const pluginhttp::VerifiedTrust authTrust{mf.pluginDir, mf.authCaFile};
++    std::string minted;
++    if (pluginhttp::mintPasswordToken(nullptr, substitute(mf.authReq.url), mf.authReq.method,
++                                      substitute(mf.authReq.body), headersFor(mf.authReq.headers), mf.authTokenPath,
++                                      minted, abort, &authTrust) &&
++        pluginhttp::saveTokenToFile(mf.tokenFile, mf.tokenPath, minted)) {
++      token = minted;
++      status = fetch();
++    }
++  }
++  // No conditional/identical-asset contract in this slice: 204/304 are failed
++  // replacements. They preserve the old file and panel; next timer is fresh.
++  if (abort() || status != 200 || !plugineventasset::validBmp(tmp, handler.width, handler.height)) {
++    Storage.remove(tmp.c_str());
++    return {};
++  }
++  return {TimedState::Staged, dest};
++}
+ 
+ void drain(GfxRenderer* renderer, const size_t maxEvents) { drain(renderer, maxEvents, {0, 0}); }
+ 
+--- a/src/util/PluginEvents.h
++++ b/src/util/PluginEvents.h
+@@ -2,6 +2,8 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <functional>
++#include <string>
+ 
+ class GfxRenderer;
+ 
+@@ -43,12 +45,15 @@
+ // a compatibility promise (semantic, not activity class names).
+ namespace pluginevents {
+ 
++class DrainBudget;
++
+ enum class Event : uint8_t {
+   ReaderOpen,      // "reader.open"      vars: book
+   ReaderExit,      // "reader.exit"      vars: book, percent
+   ReaderSession,   // "reader.session"   vars: book, document, active-session summary
+   BookDownloaded,  // "book.downloaded"  vars: path, title, plugin
+   SleepEnter,      // "sleep.enter"      vars: book, percent when sleeping from a reader, else none
++  SleepTimer,      // "sleep.timer"; never queued or replayed
+   COUNT
+ };
+ 
+@@ -93,4 +98,20 @@
+ void drain(GfxRenderer* renderer, size_t maxEvents = 4);
+ void drain(GfxRenderer* renderer, size_t maxEvents, DrainLimits limits);
+ 
++// Timer route: exactly one verified, full-native BMP download to
++// /sleep.bmp. No reader outbox, toast, book sidecar or general drain is touched.
++// Staged means .part passed validation; paint decodes it before committing.
++// NoHandler means no operation; HTTP 204/304 are Failure, never empty images.
++enum class TimedState : uint8_t { NoHandler, Staged, Failure };
++struct TimedResult {
++  TimedState state = TimedState::Failure;
++  std::string asset;
++};
++// Snapshot one qualified manifest, grant and config without network. Returns
++// runtime interval in microseconds or 0. Refresh/discard invalidates the snapshot.
++uint64_t prepareTimed(int width, int height);
++void discardTimed();
++// Consumes the prepared attempt exactly once, including abort/failure.
++TimedResult timedSync(DrainBudget& budget, const std::function<bool()>& shouldAbort);
++
+ }  // namespace pluginevents
+--- a/src/util/PluginHttp.cpp
++++ b/src/util/PluginHttp.cpp
+@@ -89,6 +89,11 @@
+ namespace pluginhttp {
+ 
+ bool peerVerificationAvailable() { return sdkPeerVerificationAvailable<freeink::SecureHttpClient>(); }
++
++bool hasLoadableTrustAnchor(const VerifiedTrust& trust) {
++  std::string caPem;
++  return peerVerificationAvailable() && loadPluginCa(trust, caPem);
++}
+ 
+ // True when a dotted-path segment addresses an array index.
+ static bool segIsIndex(const std::string& seg) { return !seg.empty() && isdigit(static_cast<unsigned char>(seg[0])); }
+--- a/src/util/PluginHttp.h
++++ b/src/util/PluginHttp.h
+@@ -57,6 +57,9 @@
+   std::string caFile;
+ };
+ 
++// Lexical CA preflight only; peer and DER verification happen in SDK TLS.
++bool hasLoadableTrustAnchor(const VerifiedTrust& trust);
++
+ // Fills `out` from a manifest request node ({url, method, body, headers}).
+ void readRequest(JsonVariantConst node, const char* defaultMethod, RequestSpec& out);
+ 
+--- /dev/null
++++ b/src/util/TimedSleepPaint.cpp
+@@ -0,0 +1,40 @@
++#include "TimedSleepPaint.h"
++
++#include <Bitmap.h>
++#include <GfxRenderer.h>
++#include <HalStorage.h>
++#include <Logging.h>
++#include <Memory.h>
++
++#include "PluginEventAsset.h"
++
++namespace timedsleeppaint {
++bool paint(GfxRenderer& renderer, const std::string& asset, const std::function<bool()>& shouldAbort) {
++  const auto aborted = [&] { return shouldAbort && shouldAbort(); };
++  const int width = renderer.getScreenWidth(), height = renderer.getScreenHeight();
++  const std::string staged = asset + ".part";
++  if (aborted() || !plugineventasset::validBmp(staged, width, height)) return false;
++  {
++    HalFile file;
++    if (!Storage.openFileForRead("TIMER", staged, file)) return false;
++    // Bitmap's 256-byte palette alone exceeds the small-stack budget.
++    auto bitmap = makeUniqueNoThrow<Bitmap>(file);
++    if (!bitmap) {
++      LOG_ERR("TIMER", "Bitmap allocation failed (%u bytes)", static_cast<unsigned>(sizeof(Bitmap)));
++      return false;
++    }
++    if (bitmap->parseHeaders() != BmpReaderError::Ok || bitmap->getWidth() != width || bitmap->getHeight() != height ||
++        aborted())
++      return false;
++    // Decode into the existing framebuffer before replacing the last-good file.
++    renderer.setRenderMode(GfxRenderer::BW);
++    renderer.clearScreen();
++    if (!renderer.drawBitmap(*bitmap, 0, 0, width, height) || aborted()) return false;
++  }
++  // The staged file must be closed before the existing checked rename.
++  // Once replacement starts, finish the transfer; Power is handled afterwards.
++  if (aborted() || !plugineventasset::commit(asset, width, height, 200)) return false;
++  renderer.displayBuffer(HalDisplay::HALF_REFRESH);
++  return true;
++}
++}  // namespace timedsleeppaint
+--- /dev/null
++++ b/src/util/TimedSleepPaint.h
+@@ -0,0 +1,9 @@
++#pragma once
++#include <functional>
++#include <string>
++class GfxRenderer;
++namespace timedsleeppaint {
++// Decode asset.part into the existing framebuffer, then commit and transfer.
++// Caller removes any leftover .part; false sends no framebuffer to the panel.
++bool paint(GfxRenderer& renderer, const std::string& asset, const std::function<bool()>& shouldAbort);
++}  // namespace timedsleeppaint
+--- /dev/null
++++ b/src/util/TimedWakeGuard.h
+@@ -0,0 +1,54 @@
++#pragma once
++
++#include <WakeupClassify.h>
++
++#include <cstdint>
++
++// One timer owner; cadence comes from the qualified runtime SD handler.
++namespace timedwake {
++// One-shot handoff when Power arrives after peripheral teardown has started.
++inline constexpr uint32_t MANUAL_WAKE_STAMP = 0x54505752;
++inline bool consumeManualWake(const int resetReason, uint32_t& stamp) {
++  const bool pending = resetReason == wakeup::RST_SW && stamp == MANUAL_WAKE_STAMP;
++  stamp = 0;
++  return pending;
++}
++
++struct Boot {
++  wakeup::Reason reason;
++  int resetReason;
++  bool supportedModel;
++  bool interruptedStartup;
++};
++
++inline uint64_t sleepInterval(const uint64_t configured, const bool supportedModel, const uint16_t batteryPercent) {
++  return supportedModel && batteryPercent >= 20 ? configured : 0;
++}
++
++// A Power takeover follows the same click-vs-hold wake preference as a
++// power-button deep-sleep wake. The press itself is latched by the caller.
++inline bool acceptManualWake(const bool heldThroughVerification, const bool clickWakeAllowed) {
++  return heldThroughVerification || clickWakeAllowed;
++}
++
++// sync() is called only on a qualified autonomous boot, never on normal wake.
++// Hooks must latch any manual Power observed during sync, including a short tap.
++template <typename Hooks>
++bool handleBoot(const Boot& boot, Hooks& hooks) {
++  if (boot.reason != wakeup::Reason::Timer || boot.resetReason != wakeup::RST_DEEPSLEEP) return false;
++  if (hooks.powerPressed()) return false;
++  uint64_t interval = 0;
++  if (boot.supportedModel && !boot.interruptedStartup && hooks.batteryPercent() >= 20) {
++    interval = hooks.prepare();
++  }
++  // Give a physical button arriving during the battery read priority.
++  if (hooks.powerPressed()) return false;
++  if (interval) {
++    hooks.sync();
++    if (hooks.powerPressed()) return false;
++    interval = sleepInterval(interval, true, hooks.batteryPercent());
++  }
++  hooks.sleep(interval);
++  return true;
++}
++}  // namespace timedwake
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -88,3 +88,5 @@
+ add_test(NAME TrustedTimeFresh COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/trusted_time_fresh/run.py)
+ 
+ add_test(NAME TimerWakeArm COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/timer_wake_arm/run.py)
++
++add_test(NAME TimedWakeGuard COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/timed_wake_guard/run.py --sanitize)
+--- a/test/plugin_verified_tls/tls_fixture.py
++++ b/test/plugin_verified_tls/tls_fixture.py
+@@ -39,8 +39,9 @@
+                              serialization.NoEncryption())
+ 
+ class LoopbackTLS:
+-    def __init__(self, cert_path, key_path, payload=b"OK", tls13=False):
++    def __init__(self, cert_path, key_path, payload=b"OK", tls13=False, status=200):
+         self.payload = payload
++        self.status = status
+         self.listener = socket.socket()
+         self.listener.bind(("127.0.0.1", 0))
+         self.listener.listen(3)
+@@ -81,7 +82,7 @@
+                                 expected = len(headers) + 4 + length
+                             if expected is not None and len(self.data) >= expected: break
+                         if expected is not None and len(self.data) >= expected:
+-                            response = b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: "
++                            response = f"HTTP/1.1 {self.status} Fixture\r\nConnection: close\r\nContent-Length: ".encode()
+                             peer.sendall(response + str(len(self.payload)).encode() + b"\r\n\r\n" + self.payload)
+                     except (OSError, ssl.SSLError): pass
+             except (OSError, ssl.SSLError):
+--- /dev/null
++++ b/test/timed_sync/BootIoTest.cpp
+@@ -0,0 +1,390 @@
++// Executes the exact production syncTimerPanel body extracted by run.py.
++// Network/join/display lifecycle boundaries are stubs; no full Arduino boot.
++#include <cassert>
++#include <cstdint>
++#include <functional>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "util/PluginDrainBudget.h"
++#include "util/TimedWakeGuard.h"
++static uint32_t timerManualWakeStamp = 0;
++static uint32_t nowMs = 0, pressAt = UINT32_MAX;
++static bool timerStorageReady = false, timerDisplayReady = false, timerDisplayStarted = false;
++static bool deepSleepInProgress = false;
++struct Slept {};
++struct Restarted {};
++static bool shortPressDuringTeardown = false;
++static int paintCalls = 0, initCalls = 0;
++static bool shortPressDuringPaint = false, shortPressDuringFetch = false;
++static bool handler = true, credential = true, emptySsid = false;
++static uint32_t fetchElapsedMs = 0;
++static std::vector<std::string> trace;
++uint32_t millis() { return nowMs; }
++void delay(uint32_t n) { nowMs += n; }
++struct GPIO {
++  bool captured = false, captureActive = false;
++  bool rawPowerButtonPressed() { return nowMs >= pressAt; }
++  bool beginPowerPressCapture() {
++    captured = false;
++    captureActive = true;
++    return true;
++  }
++  bool powerPressCaptured() { return captured || rawPowerButtonPressed(); }
++  void endPowerPressCapture() {
++    captureActive = false;
++    captured = false;
++  }
++  void shortPulse() {
++    if (captureActive) captured = true;
++  }
++} gpio;
++struct PM {
++  int battery = 80;
++  uint64_t lastInterval = UINT64_MAX;
++  bool lastFromTimer = false;
++  int getBatteryPercentage() { return battery; }
++  void startDeepSleep(GPIO&, uint64_t interval) {
++    lastInterval = interval;
++    trace.push_back("SLEEP");
++    throw Slept{};
++  }
++  void startDeepSleep(GPIO&, uint64_t interval, bool fromTimer) {
++    lastInterval = interval;
++    lastFromTimer = fromTimer;
++    if (fromTimer && gpio.powerPressCaptured()) return;
++    trace.push_back("SLEEP");
++    throw Slept{};
++  }
++} powerManager;
++struct Store {
++  bool ok = true, mounted = false;
++  bool ready() { return mounted; }
++  bool begin() {
++    trace.push_back("SD");
++    mounted = ok;
++    return ok;
++  }
++  void prepareForDeepSleep() {
++    trace.push_back("SD_SLEEP");
++    if (shortPressDuringTeardown) gpio.shortPulse();
++  }
++  bool remove(const char* path) {
++    assert(std::string(path) == "/sleep.bmp.part");
++    return true;
++  }
++} Storage;
++struct Display {
++  void deepSleep() { trace.push_back("DISPLAY_SLEEP"); }
++} display;
++struct Light {
++  void setOn(bool on) {
++    assert(!on);
++    trace.push_back("LIGHT_OFF");
++  }
++} Frontlight;
++struct Tilt {
++  void deepSleep() { trace.push_back("TILT_SLEEP"); }
++} halTiltSensor;
++struct Esp {
++  void restart() { throw Restarted{}; }
++} ESP;
++struct Clock {
++  void begin() {}
++} halClock;
++namespace trustedtime {
++void init() {}
++bool clockReady = true;
++int syncStarts = 0;
++uint32_t clockElapsedMs = 0;
++bool fresh = false;
++bool syncFresh(uint32_t timeout, const std::function<bool()>& abort) {
++  ++syncStarts;
++  fresh = false;
++  if (abort()) return false;
++  if (!clockReady) {
++    while (timeout && !abort()) {
++      delay(50);
++      timeout -= 50;
++    }
++    return false;
++  }
++  delay(clockElapsedMs);
++  fresh = !abort();
++  return fresh;
++}
++bool hasFreshSync() { return fresh; }
++}  // namespace trustedtime
++namespace BoardConfig {
++bool supported = true;
++bool isSticky() { return supported; }
++bool isX4Pro() { return false; }
++struct Profile {
++  int displayWidth = 800, displayHeight = 480;
++};
++static Profile ACTIVE;
++}  // namespace BoardConfig
++struct Cred {
++  std::string ssid, password;
++};
++struct WifiStore {
++  void loadFromFile() {}
++  std::string getLastConnectedSsid() { return "fixture"; }
++  std::optional<Cred> findCredential(const std::string&) {
++    return credential ? std::optional<Cred>(Cred{emptySsid ? "" : "fixture", ""}) : std::nullopt;
++  }
++} WIFI_STORE;
++constexpr int WL_CONNECTED = 1, WIFI_STA = 2, WIFI_OFF = 0;
++struct Wifi {
++  bool online = false, canJoin = true;
++  int begins = 0, modeValue = 0;
++  int status() { return online ? WL_CONNECTED : 0; }
++  void mode(int m) {
++    modeValue = m;
++    trace.push_back(m == WIFI_OFF ? "OFF" : "STA");
++  }
++  void begin(const char*, const char*) {
++    ++begins;
++    online = canJoin;
++    trace.push_back("JOIN");
++  }
++  void disconnect(bool) { online = false; }
++} WiFi;
++namespace pluginevents {
++enum class TimedState { NoHandler, Staged, Failure };
++struct Result {
++  TimedState state;
++  std::string asset;
++};
++static TimedState state = TimedState::Staged;
++void refreshSubscriptions() {}
++static bool prepared = false;
++void discardTimed() { prepared = false; }
++uint64_t prepareTimed(int width, int height) {
++  assert(width == 480 && height == 800);
++  prepared = handler;
++  return prepared ? 60000000ULL : 0;
++}
++Result timedSync(DrainBudget& budget, const std::function<bool()>& abort) {
++  assert(prepared);
++  prepared = false;
++  trace.push_back("FETCH");
++  if (!budget.beginAttempt()) return {TimedState::Failure, {}};
++  if (shortPressDuringFetch) gpio.shortPulse();
++  delay(fetchElapsedMs);
++  return {abort() ? TimedState::Failure : state, "/sleep.bmp"};
++}
++}  // namespace pluginevents
++static int renderer;
++static void setupBitmapDisplay(bool) {
++  ++initCalls;
++  timerDisplayReady = true;
++  trace.push_back("INIT");
++}
++namespace timedsleeppaint {
++bool paint(int&, const std::string&, const std::function<bool()>& abort) {
++  ++paintCalls;
++  trace.push_back("PAINT");
++  if (shortPressDuringPaint) gpio.shortPulse();
++  return !abort();
++}
++}  // namespace timedsleeppaint
++static bool syncTimerPanel();
++static uint64_t prepareTimerPanel();
++#include "TimerBootHooksSource.inc"
++#include "TimerPanelSource.inc"
++static bool runSync() {
++  gpio.beginPowerPressCapture();
++  if (timerHooks.powerPressed()) return true;
++  if (!timerHooks.prepare()) return false;
++  timerHooks.sync();
++  gpio.endPowerPressCapture();
++  return timerHooks.manualPower;
++}
++static void reset() {
++  nowMs = 0;
++  pressAt = UINT32_MAX;
++  gpio = GPIO{};
++  shortPressDuringPaint = shortPressDuringFetch = shortPressDuringTeardown = false;
++  timerManualWakeStamp = 0;
++  powerManager.lastFromTimer = false;
++  timerStorageReady = timerDisplayReady = false;
++  paintCalls = initCalls = 0;
++  timerDisplayStarted = false;
++  deepSleepInProgress = false;
++  timerHooks.manualPower = false;
++  handler = credential = true;
++  trustedtime::clockReady = true;
++  trustedtime::syncStarts = 0;
++  trustedtime::clockElapsedMs = 0;
++  trustedtime::fresh = false;
++  fetchElapsedMs = 0;
++  emptySsid = false;
++  Storage.ok = true;
++  Storage.mounted = false;
++  pluginevents::discardTimed();
++  powerManager.battery = 80;
++  powerManager.lastInterval = UINT64_MAX;
++  BoardConfig::supported = true;
++  WiFi = Wifi{};
++  trace.clear();
++  pluginevents::state = pluginevents::TimedState::Staged;
++}
++int main() {
++  reset();
++  Storage.ok = false;
++  assert(!runSync());
++  assert(WiFi.begins == 0 && initCalls == 0 && !timerStorageReady);
++  reset();
++  handler = false;
++  assert(!runSync());
++  assert(WiFi.begins == 0 && initCalls == 0);
++  reset();
++  credential = false;
++  assert(!runSync());
++  assert(WiFi.begins == 0 && initCalls == 0);
++  reset();
++  emptySsid = true;
++  assert(timerHooks.prepare() == 0);
++  assert(!pluginevents::prepared && WiFi.begins == 0 && trustedtime::syncStarts == 0);
++  reset();
++  assert(timerHooks.prepare());
++  emptySsid = true;  // Defensive recheck in the actual sync caller.
++  assert(!syncTimerPanel());
++  assert(!pluginevents::prepared && WiFi.begins == 0 && trustedtime::syncStarts == 0);
++  reset();
++  WiFi.canJoin = false;
++  assert(!runSync());
++  assert(nowMs == 10000 && initCalls == 0 && WiFi.modeValue == WIFI_OFF && trustedtime::syncStarts == 0);
++  reset();
++  pluginevents::state = pluginevents::TimedState::Failure;
++  assert(!runSync());
++  assert(initCalls == 0 && paintCalls == 0 && WiFi.modeValue == WIFI_OFF);
++  reset();
++  assert(!runSync());
++  assert(initCalls == 1 && paintCalls == 1 && timerStorageReady && timerDisplayReady);
++  assert(nowMs == 0 && trustedtime::syncStarts == 1);
++  assert(trace == std::vector<std::string>({"SD", "STA", "JOIN", "FETCH", "INIT", "PAINT", "OFF"}));
++  reset();
++  shortPressDuringPaint = true;
++  assert(runSync());
++  assert(paintCalls == 1 && !gpio.rawPowerButtonPressed());
++  assert(!gpio.captureActive && WiFi.modeValue == WIFI_OFF);
++  reset();
++  shortPressDuringFetch = true;
++  assert(runSync());
++  assert(paintCalls == 0 && !gpio.rawPowerButtonPressed());
++  assert(!gpio.captureActive && WiFi.modeValue == WIFI_OFF);
++  reset();
++  trustedtime::clockElapsedMs = 5000;
++  fetchElapsedMs = 10000;
++  assert(!runSync());
++  assert(nowMs == 15000 && trustedtime::syncStarts == 1);
++  assert(initCalls == 0 && paintCalls == 0 && WiFi.modeValue == WIFI_OFF);
++  reset();
++  trustedtime::clockElapsedMs = 4999;
++  fetchElapsedMs = 9999;
++  assert(!runSync());
++  assert(nowMs == 14998 && initCalls == 1 && paintCalls == 1);
++  reset();
++  powerManager.battery = 19;
++  assert(!runSync());
++  assert(initCalls == 0 && paintCalls == 0);
++  reset();
++  WiFi.canJoin = false;
++  pressAt = 200;
++  assert(runSync());
++  assert(initCalls == 0 && nowMs == 200 && WiFi.modeValue == WIFI_OFF && trustedtime::syncStarts == 0);
++  reset();
++  trustedtime::clockReady = false;
++  assert(!runSync());
++  assert(nowMs == 5000 && initCalls == 0 && paintCalls == 0 && WiFi.modeValue == WIFI_OFF);
++  for (const auto& event : trace) assert(event != "FETCH");
++  reset();
++  trustedtime::clockReady = false;
++  pressAt = 100;
++  assert(runSync());
++  assert(nowMs == 100 && initCalls == 0 && WiFi.modeValue == WIFI_OFF);
++  for (const auto& event : trace) assert(event != "FETCH");
++  reset();
++  pressAt = 0;
++  assert(runSync());
++  assert(trace.empty() && trustedtime::syncStarts == 0);
++  reset();
++  WiFi.canJoin = false;
++  pressAt = 200;
++  timerHooks.prepare();
++  timerHooks.sync();
++  pressAt = UINT32_MAX;
++  assert(timerHooks.powerPressed());  // Observed Power remains latched after release.
++  reset();
++  assert(timerHooks.prepare() == 60000000ULL);
++  assert(timerStorageReady && Storage.mounted && pluginevents::prepared);
++  assert(timerHooks.prepare() == 60000000ULL);
++  assert(trace == std::vector<std::string>({"SD"}));
++  pluginevents::discardTimed();
++  assert(!pluginevents::prepared);
++  reset();
++  timerStorageReady = timerDisplayStarted = true;
++  try {
++    timerHooks.sleep(60000000);
++    assert(false);
++  } catch (const Slept&) {
++  }
++  assert(trace == std::vector<std::string>({"DISPLAY_SLEEP", "SD_SLEEP", "SLEEP"}));
++  assert(deepSleepInProgress);
++  reset();
++  timerStorageReady = timerDisplayStarted = true;
++  gpio.beginPowerPressCapture();
++  shortPressDuringTeardown = true;
++  try {
++    timerHooks.sleep(60000000);
++    assert(false);
++  } catch (const Restarted&) {
++  }
++  assert(timerManualWakeStamp == timedwake::MANUAL_WAKE_STAMP);
++  assert(timedwake::consumeManualWake(wakeup::RST_SW, timerManualWakeStamp));
++  assert(timerManualWakeStamp == 0 && !gpio.rawPowerButtonPressed());
++  reset();
++  timerDisplayStarted = true;  // Partial display init still gets teardown.
++  try {
++    timerHooks.sleep(0);
++    assert(false);
++  } catch (const Slept&) {
++  }
++  assert(trace == std::vector<std::string>({"DISPLAY_SLEEP", "SLEEP"}));
++  reset();
++  timerStorageReady = timerDisplayStarted = true;
++  Storage.mounted = true;
++  try {
++    returnToTimerStandby();
++    assert(false);
++  } catch (const Slept&) {
++  }
++  assert(powerManager.lastInterval == 60000000ULL && powerManager.lastFromTimer);
++  assert(trace == std::vector<std::string>({"LIGHT_OFF", "TILT_SLEEP", "DISPLAY_SLEEP", "SD_SLEEP", "SLEEP"}));
++  assert(!pluginevents::prepared);
++  reset();
++  timerStorageReady = timerDisplayStarted = true;
++  Storage.mounted = true;
++  handler = false;
++  try {
++    returnToTimerStandby();
++    assert(false);
++  } catch (const Slept&) {
++  }
++  assert(powerManager.lastInterval == 0 && !pluginevents::prepared);
++  assert(trace == std::vector<std::string>({"LIGHT_OFF", "TILT_SLEEP", "DISPLAY_SLEEP", "SD_SLEEP", "SLEEP"}));
++  reset();
++  timerStorageReady = timerDisplayStarted = true;
++  Storage.mounted = true;
++  powerManager.battery = 19;
++  try {
++    returnToTimerStandby();
++    assert(false);
++  } catch (const Slept&) {
++  }
++  assert(powerManager.lastInterval == 0 && !pluginevents::prepared);
++  assert(trace == std::vector<std::string>({"LIGHT_OFF", "TILT_SLEEP", "DISPLAY_SLEEP", "SD_SLEEP", "SLEEP"}));
++}
+--- /dev/null
++++ b/test/timed_sync/PaintTest.cpp
+@@ -0,0 +1,106 @@
++#include <GfxRenderer.h>
++#include <HalStorage.h>
++
++#include <cassert>
++#include <new>
++#include <string>
++
++#include "util/TimedSleepPaint.h"
++static int allocationToFail = 0;
++void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
++  if (allocationToFail > 0 && --allocationToFail == 0) return nullptr;
++  try {
++    return ::operator new(size);
++  } catch (...) {
++    return nullptr;
++  }
++}
++static std::string bmp() {
++  std::string bytes(94, '\0');
++  auto put = [&](int at, unsigned n) {
++    for (int i = 0; i < 4; ++i) bytes[at + i] = static_cast<char>(n >> (8 * i));
++  };
++  bytes[0] = 'B';
++  bytes[1] = 'M';
++  put(2, 94);
++  put(10, 62);
++  put(14, 40);
++  put(18, 8);
++  put(22, 8);
++  bytes[26] = 1;
++  bytes[28] = 1;
++  bytes[58] = bytes[59] = bytes[60] = static_cast<char>(255);
++  return bytes;
++}
++int main() {
++  const std::string path = "/sleep.bmp", staged = path + ".part";
++  const std::string old = [] {
++    auto bytes = bmp();
++    bytes.back() = 85;
++    return bytes;
++  }();
++  const auto reset = [&] {
++    Storage = StorageStub{};
++    Storage.files[path] = old;
++    Storage.files[staged] = bmp();
++  };
++  reset();
++  GfxRenderer ok;
++  assert(timedsleeppaint::paint(ok, path, {}));
++  assert(ok.paints == 1 && ok.draws == 1);
++  assert(Storage.files[path] == bmp() && !Storage.exists(staged.c_str()));
++  reset();
++  GfxRenderer bad;
++  bad.failDraw = true;
++  assert(!timedsleeppaint::paint(bad, path, {}));
++  assert(bad.paints == 0 && Storage.files[path] == old);
++  reset();
++  Storage.readStop = 70;
++  GfxRenderer shortRow;
++  assert(!timedsleeppaint::paint(shortRow, path, {}));
++  assert(shortRow.draws == 1 && shortRow.paints == 0);
++  assert(Storage.files[path] == old);  // Valid header, unreadable row: do not replace.
++  reset();
++  GfxRenderer dim;
++  dim.width = 9;
++  assert(!timedsleeppaint::paint(dim, path, {}));
++  assert(dim.paints == 0 && Storage.files[path] == old);
++  reset();
++  Storage.files[staged] = "bad";
++  GfxRenderer header;
++  assert(!timedsleeppaint::paint(header, path, {}));
++  assert(header.paints == 0 && Storage.files[path] == old);
++  reset();
++  GfxRenderer manual;
++  int checks = 0;
++  assert(!timedsleeppaint::paint(manual, path, [&] { return ++checks == 3; }));
++  assert(manual.draws == 1 && manual.paints == 0 && Storage.files[path] == old);
++  reset();
++  Storage.failRead = staged;
++  GfxRenderer sd;
++  assert(!timedsleeppaint::paint(sd, path, {}));
++  assert(sd.paints == 0 && Storage.files[path] == old);
++  reset();
++  Storage.failRenameTo = path + ".bak";
++  GfxRenderer rename;
++  assert(!timedsleeppaint::paint(rename, path, {}));
++  assert(rename.draws == 1 && rename.paints == 0 && Storage.files[path] == old);
++  reset();
++  Storage.failRenameFrom = staged;
++  GfxRenderer restore;
++  assert(!timedsleeppaint::paint(restore, path, {}));
++  assert(restore.paints == 0 && Storage.files[path] == old);
++  reset();
++  bool powerDuringCommit = false;
++  Storage.afterRename = [&] { powerDuringCommit = true; };
++  GfxRenderer commitThenPower;
++  assert(timedsleeppaint::paint(commitThenPower, path, [&] { return powerDuringCommit; }));
++  assert(powerDuringCommit && commitThenPower.paints == 1 && Storage.files[path] == bmp());
++  reset();
++  GfxRenderer allocationFailure;
++  allocationToFail = 2;  // Prevalidation succeeds; the paint decoder allocation fails.
++  assert(!timedsleeppaint::paint(allocationFailure, path, {}));
++  assert(allocationToFail == 0 && allocationFailure.paints == 0);
++  assert(allocationFailure.clears == 0 && allocationFailure.draws == 0);
++  assert(Storage.files[path] == old);
++}
+--- /dev/null
++++ b/test/timed_sync/PowerCaptureTest.cpp
+@@ -0,0 +1,114 @@
++// Executes the HAL capture methods with controlled GPIO interrupt boundaries.
++#include <cassert>
++#include <cstdint>
++
++#define IRAM_ATTR
++#define LOG_ERR(...)
++struct portMUX_TYPE {
++  int depth = 0;
++};
++#define portMUX_INITIALIZER_UNLOCKED \
++  {                                  \
++  }
++#define portENTER_CRITICAL(mux) (++(mux)->depth)
++#define portEXIT_CRITICAL(mux) (--(mux)->depth)
++#define portENTER_CRITICAL_ISR(mux) portENTER_CRITICAL(mux)
++#define portEXIT_CRITICAL_ISR(mux) portEXIT_CRITICAL(mux)
++using gpio_num_t = int;
++constexpr int ESP_OK = 0, ESP_ERR_INVALID_STATE = 1;
++constexpr int GPIO_INTR_POSEDGE = 3, GPIO_INTR_NEGEDGE = 4;
++static int serviceResult = ESP_OK, edgeResult = ESP_OK, attachResult = ESP_OK;
++static int edge = 0, installs = 0, removes = 0, disables = 0;
++static bool physicalPower = false;
++static void (*handler)(void*) = nullptr;
++static void* argument = nullptr;
++int gpio_install_isr_service(int flags) {
++  assert(flags == 0);
++  ++installs;
++  return serviceResult;
++}
++int gpio_set_intr_type(gpio_num_t pin, int type) {
++  assert(pin == 3);
++  edge = type;
++  return edgeResult;
++}
++int gpio_isr_handler_add(gpio_num_t pin, void (*callback)(void*), void* context) {
++  assert(pin == 3);
++  if (attachResult != ESP_OK) return attachResult;
++  handler = callback;
++  argument = context;
++  return ESP_OK;
++}
++int gpio_intr_disable(gpio_num_t pin) {
++  assert(pin == 3);
++  ++disables;
++  return ESP_OK;
++}
++int gpio_isr_handler_remove(gpio_num_t pin) {
++  assert(pin == 3);
++  ++removes;
++  handler = nullptr;
++  argument = nullptr;
++  return ESP_OK;
++}
++namespace BoardConfig {
++static bool supported = true;
++bool isSticky() { return supported; }
++bool isX4Pro() { return false; }
++struct Profile {
++  struct Input {
++    int8_t power = 3;
++    bool powerActiveHigh = false;
++  } input;
++} ACTIVE;
++}  // namespace BoardConfig
++class HalGPIO {
++ public:
++  bool capturedPowerPress = false;
++  mutable portMUX_TYPE powerCaptureMux = portMUX_INITIALIZER_UNLOCKED;
++  int8_t capturedPowerPin = -1;
++  static void capturePowerPress(void*);
++  bool rawPowerButtonPressed() const { return physicalPower; }
++  bool beginPowerPressCapture();
++  bool powerPressCaptured() const;
++  void endPowerPressCapture();
++};
++#include "PowerCaptureSource.inc"
++
++int main() {
++  HalGPIO gpio;
++  assert(gpio.beginPowerPressCapture() && edge == GPIO_INTR_NEGEDGE);
++  assert(!gpio.powerPressCaptured());
++  physicalPower = true;
++  handler(argument);
++  physicalPower = false;
++  assert(gpio.powerPressCaptured());  // Press and release entirely inside blocking I/O.
++  assert(gpio.powerCaptureMux.depth == 0);
++  gpio.endPowerPressCapture();
++  assert(!handler && removes == 1 && disables == 1 && gpio.capturedPowerPin == -1);
++
++  serviceResult = ESP_ERR_INVALID_STATE;
++  BoardConfig::ACTIVE.input.powerActiveHigh = true;
++  assert(gpio.beginPowerPressCapture() && edge == GPIO_INTR_POSEDGE);
++  assert(!gpio.powerPressCaptured());
++  physicalPower = true;
++  assert(gpio.powerPressCaptured());  // A held level also works before an ISR runs.
++  physicalPower = false;
++  gpio.endPowerPressCapture();
++
++  serviceResult = 9;
++  assert(!gpio.beginPowerPressCapture() && !handler);
++  serviceResult = ESP_OK;
++  edgeResult = 9;
++  assert(!gpio.beginPowerPressCapture() && !handler);
++  edgeResult = ESP_OK;
++  attachResult = 9;
++  assert(!gpio.beginPowerPressCapture() && !handler && gpio.capturedPowerPin == -1);
++  attachResult = ESP_OK;
++  BoardConfig::supported = false;
++  const int previousInstalls = installs;
++  assert(!gpio.beginPowerPressCapture() && installs == previousInstalls);
++  BoardConfig::supported = true;
++  BoardConfig::ACTIVE.input.power = -1;
++  assert(!gpio.beginPowerPressCapture() && installs == previousInstalls);
++}
+--- /dev/null
++++ b/test/timed_sync/RealTlsTest.cpp
+@@ -0,0 +1,62 @@
++// Actual timed selection, SDK TLS and BMP decode; SD, clock and panel are host boundaries.
++#include <GfxRenderer.h>
++#include <HalStorage.h>
++#include <SecureHttpClient.h>
++#include <TrustedTime.h>
++
++#undef time
++#include <ctime>
++#include <fstream>
++#include <iostream>
++#include <iterator>
++
++#include "util/PluginDrainBudget.h"
++#include "util/PluginEvents.h"
++#include "util/PluginLocations.h"
++#include "util/TimedSleepPaint.h"
++
++namespace PluginLocations {
++std::vector<Entry> scanPlugins() { return {{"fixture", "/plugins/fixture", false, true, false}}; }
++std::string findPluginDir(const char*) { return {}; }
++}  // namespace PluginLocations
++static std::string read(const char* name) {
++  std::ifstream input(name, std::ios::binary);
++  return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
++}
++int main(int argc, char** argv) {
++  if (argc != 4) return 2;
++  const auto now = static_cast<int64_t>(std::time(nullptr));
++  trustedtime::now = trustedtime::systemNow = now;
++  trustedtime::fresh = true;
++  const std::string asset = read(argv[3]);
++  if (asset.empty()) return 2;
++  std::string old = asset;
++  old.back() ^= 0x55;
++  Storage.files["/sleep.bmp"] = old;
++  Storage.files["/plugins/fixture/ca.pem"] = read(argv[2]);
++  Storage.files["/plugins/fixture/token.json"] = R"({"token":"TEST-ONLY-TOKEN"})";
++  Storage.files["/plugins/fixture/device.json"] =
++      std::string(
++          R"({"token":{"file":"token.json"},"events":{"sleep.timer":{"interval_seconds":60,"download":{"url":"https://good.test:)") +
++      argv[1] +
++      R"(/frame","headers":{"Authorization":"Bearer {token}"},"dest":"/sleep.bmp","format":"bmp","width":8,"height":8,"tls":{"ca_file":"ca.pem"}}}}})";
++  Storage.files["/plugins/fixture/events.jsonl"] = "private-reader-outbox";
++  Storage.files["/.crosspoint/state.json"] = "private-reader-position";
++  pluginevents::refreshSubscriptions();
++  const auto interval = pluginevents::prepareTimed(8, 8);
++  pluginevents::DrainBudget budget(4, 15000, []() -> uint32_t { return millis(); });
++  const auto result = pluginevents::timedSync(budget, {});
++  GfxRenderer renderer;
++  const bool painted =
++      result.state == pluginevents::TimedState::Staged && timedsleeppaint::paint(renderer, result.asset, {});
++  Storage.remove("/sleep.bmp.part");
++  std::cout << "{\"armed_us\":" << interval << ",\"painted\":" << (painted ? "true" : "false")
++            << ",\"paints\":" << renderer.paints
++            << ",\"old_preserved\":" << (Storage.files["/sleep.bmp"] == old ? "true" : "false")
++            << ",\"private_unchanged\":"
++            << ((Storage.files["/plugins/fixture/events.jsonl"] == "private-reader-outbox" &&
++                 Storage.files["/.crosspoint/state.json"] == "private-reader-position")
++                    ? "true"
++                    : "false")
++            << "}\n";
++}
+--- /dev/null
++++ b/test/timed_sync/TimedSyncTest.cpp
+@@ -0,0 +1,297 @@
++#include <HalStorage.h>
++#include <SecureHttpClient.h>
++#include <TrustedTime.h>
++
++#include <cassert>
++#include <string>
++#include <vector>
++
++#include "util/PluginDrainBudget.h"
++#include "util/PluginEvents.h"
++#include "util/PluginLocations.h"
++uint32_t millis() { return freeink::fakeNow; }
++namespace PluginLocations {
++std::vector<Entry> entries;
++std::vector<Entry> scanPlugins() { return entries; }
++std::string findPluginDir(const char*) { return {}; }
++}  // namespace PluginLocations
++static const std::string history = R"({"e":"reader.session","vars":{"book":"private.epub"}})"
++                                   "\n";
++static const std::string manifest =
++    R"({"token":{"file":"token.json"},"events":{"sleep.timer":{"interval_seconds":60,"download":{"url":"https://fixture.invalid/{cfg.slot}?token={token}&id={event.id}","dest":"/sleep.bmp","format":"bmp","width":8,"height":8,"tls":{"ca_file":"ca.pem"}},"toast":"must never appear"},"reader.session":{"request":{"url":"https://fixture.invalid/history"}}},"config":{"file":"config.json"}})";
++static std::string bmp() {
++  std::string bytes(94, '\0');
++  auto put = [&](int at, unsigned n) {
++    for (int i = 0; i < 4; ++i) bytes[at + i] = static_cast<char>(n >> (8 * i));
++  };
++  bytes[0] = 'B';
++  bytes[1] = 'M';
++  put(2, 94);
++  put(10, 62);
++  put(14, 40);
++  put(18, 8);
++  put(22, 8);
++  bytes[26] = 1;
++  bytes[28] = 1;
++  bytes[58] = bytes[59] = bytes[60] = static_cast<char>(255);
++  return bytes;
++}
++static void setup(std::string mf = manifest) {
++  Storage = StorageStub{};
++  PluginLocations::entries = {{"fixture", "/plugins/fixture", false, true, false}};
++  Storage.files["/plugins/fixture/device.json"] = mf;
++  Storage.files["/plugins/fixture/events.jsonl"] = history;
++  Storage.files["/plugins/fixture/token.json"] = R"({"token":"fixture-token"})";
++  Storage.files["/plugins/fixture/config.json"] = R"({"slot":"frame"})";
++  Storage.files["/plugins/fixture/ca.pem"] =
++      "-----BEGIN CERTIFICATE-----\nfixture-not-a-real-certificate-pad\n-----END CERTIFICATE-----";
++  Storage.files["/sleep.bmp"] = bmp();
++  freeink::fakeNow = 0;
++  trustedtime::now = 1800000000;
++  trustedtime::systemNow = trustedtime::now;
++  trustedtime::fresh = true;  // main's fresh clock attempt precedes timedSync.
++  auto& replies = freeink::SecureHttpClient::replies;
++  replies = {{200, bmp(), 0}};
++  freeink::SecureHttpClient::sends = 0;
++  freeink::SecureHttpClient::insecureCalls = 0;
++  freeink::SecureHttpClient::caCalls = 0;
++  freeink::SecureHttpClient::aborted = false;
++  freeink::SecureHttpClient::beginOk = true;
++  pluginevents::refreshSubscriptions();
++}
++static pluginevents::TimedResult consumeTimed(const std::function<bool()>& abort) {
++  pluginevents::DrainBudget budget(4, 15000, &millis);
++  return pluginevents::timedSync(budget, abort);
++}
++static pluginevents::TimedResult runTimed(int width, int height, const std::function<bool()>& abort) {
++  pluginevents::prepareTimed(width, height);
++  return consumeTimed(abort);
++}
++int main() {
++  using S = pluginevents::TimedState;
++  using HTTP = freeink::SecureHttpClient;
++  setup();
++#if TEST_PEER_VERIFICATION_AVAILABLE
++  assert((pluginevents::prepareTimed(8, 8) != 0));
++#else
++  assert(!(pluginevents::prepareTimed(8, 8) != 0));
++#endif
++  const auto old = Storage.files["/sleep.bmp"];
++#if !TEST_PEER_VERIFICATION_AVAILABLE
++  assert(runTimed(8, 8, {}).state == S::Failure);
++  assert(HTTP::sends == 0 && HTTP::insecureCalls == 0);
++  assert(Storage.files["/sleep.bmp"] == old);
++#else
++  // W08 preserves the installed root; each timer cycle reads its current config.
++  for (const char* root : PluginLocations::ROOTS) {
++    setup();
++    const std::string installed = std::string(root) + "/fixture";
++    auto files = Storage.files;
++    for (const auto& item : files) {
++      const std::string prefix = "/plugins/fixture";
++      if (item.first.compare(0, prefix.size(), prefix) == 0) {
++        Storage.files.erase(item.first);
++        Storage.files[installed + item.first.substr(prefix.size())] = item.second;
++      }
++    }
++    PluginLocations::entries = {{"fixture", installed, false, true, false}};
++    pluginevents::refreshSubscriptions();
++    assert(pluginevents::prepareTimed(8, 8) == 60000000ULL);
++    assert(consumeTimed({}).state == S::Staged);
++    Storage.files[installed + "/config.json"] = R"({"slot":"updated-frame"})";
++    HTTP::replies.push_back({200, bmp(), 0});
++    assert(pluginevents::prepareTimed(8, 8) == 60000000ULL);
++    assert(consumeTimed({}).state == S::Staged);
++    assert(HTTP::lastUrl.find("/updated-frame?token=fixture-token&") != std::string::npos);
++    assert(Storage.files[installed + "/events.jsonl"] == history);
++    Storage.files.erase(installed + "/device.json");
++    pluginevents::refreshSubscriptions();
++    assert(pluginevents::prepareTimed(8, 8) == 0);
++  }
++  setup();
++  auto result = runTimed(8, 8, {});
++  assert(result.state == S::Staged && result.asset == "/sleep.bmp");
++  assert(Storage.files["/sleep.bmp"] == old);
++  assert(Storage.files["/sleep.bmp.part"] == bmp());
++  assert(HTTP::sends == 1 && HTTP::caCalls == 1 && HTTP::insecureCalls == 0);
++  assert(HTTP::lastUrl.find("/frame?token=fixture-token&id=") != std::string::npos);
++  assert(HTTP::lastUrl.find("private.epub") == std::string::npos);
++  assert(Storage.files["/plugins/fixture/events.jsonl"] == history);
++  for (int status : {204, 304, 401, 403, 500, -1}) {
++    setup();
++    HTTP::replies = {{status, "", 0}};
++    assert(runTimed(8, 8, {}).state == S::Failure);
++    assert(Storage.files["/sleep.bmp"] == old && HTTP::insecureCalls == 0);
++  }
++  setup();
++  HTTP::replies = {{200, "malformed BMP", 0}};
++  assert(runTimed(8, 8, {}).state == S::Failure);
++  assert(Storage.files["/sleep.bmp"] == old);
++  setup();
++  Storage.failWrite = true;
++  assert(runTimed(8, 8, {}).state == S::Failure);
++  assert(Storage.files["/sleep.bmp"] == old);
++  setup();
++  HTTP::beginOk = false;
++  assert(runTimed(8, 8, {}).state == S::Failure);
++  assert(HTTP::sends == 0);
++  setup();
++  trustedtime::now = 0;
++  assert(runTimed(8, 8, {}).state == S::Failure);
++  assert(HTTP::sends == 0);
++  setup();
++  Storage.files.erase("/plugins/fixture/token.json");
++  assert(runTimed(8, 8, {}).state == S::Failure);
++  assert(HTTP::sends == 0);
++  setup();
++  Storage.files["/plugins/fixture/token.json"] = R"({"token":""})";
++  assert(runTimed(8, 8, {}).state == S::Failure);
++  assert(HTTP::sends == 0 && Storage.files["/sleep.bmp"] == old);
++  assert(Storage.files["/plugins/fixture/events.jsonl"] == history);
++  std::string tokenless = manifest;
++  const std::string tokenDeclaration = R"("token":{"file":"token.json"},)";
++  const auto tokenPosition = tokenless.find(tokenDeclaration);
++  assert(tokenPosition != std::string::npos);
++  tokenless.erase(tokenPosition, tokenDeclaration.size());
++  setup(tokenless);
++  assert(runTimed(8, 8, {}).state == S::Failure);
++  assert(HTTP::sends == 0 && Storage.files["/sleep.bmp"] == old);
++  assert(Storage.files["/plugins/fixture/events.jsonl"] == history);
++  setup();
++  Storage.files.erase("/plugins/fixture/ca.pem");
++  assert(runTimed(8, 8, {}).state == S::Failure);
++  assert(HTTP::sends == 0);
++  setup();
++  HTTP::replies = {{200, bmp(), 16000}};
++  assert(runTimed(8, 8, {}).state == S::Failure);
++  assert(Storage.files["/sleep.bmp"] == old);
++  // Verified password refresh reuses one shared budget; insecure auth is never called.
++  const std::string verifiedGrant =
++      R"({"type":"password","request":{"url":"https://fixture.invalid/auth","tls":{"ca_file":"ca.pem"}}})";
++  setup(std::string("{\"auth\":") + verifiedGrant + "," + manifest.substr(1));
++  HTTP::replies = {{401, "", 0}, {200, R"({"access_token":"new-fixture-token"})", 0}, {200, bmp(), 0}};
++  assert(runTimed(8, 8, {}).state == S::Staged);
++  assert(HTTP::sends == 3 && HTTP::insecureCalls == 0);
++  assert(Storage.files["/plugins/fixture/token.json"].find("new-fixture-token") != std::string::npos);
++  // A clock wait has already consumed 5s of the same 15s window. An auth
++  // response reaching its deadline cannot start the image retry.
++  setup(std::string("{\"auth\":") + verifiedGrant + "," + manifest.substr(1));
++  HTTP::replies = {{401, "", 2000}, {200, R"({"access_token":"late-token"})", 8000}, {200, bmp(), 0}};
++  pluginevents::prepareTimed(8, 8);
++  pluginevents::DrainBudget shared(4, 15000, &millis);
++  freeink::fakeNow += 5000;
++  assert(pluginevents::timedSync(shared, {}).state == S::Failure);
++  assert(HTTP::sends == 2 && Storage.files["/sleep.bmp"] == old);
++  assert(Storage.files["/plugins/fixture/events.jsonl"] == history);
++  setup(std::string("{\"auth\":") + R"({"type":"password","request":{"url":"https://fixture.invalid/auth"}})" + "," +
++        manifest.substr(1));
++  HTTP::replies = {{401, "", 0}, {200, R"({"access_token":"forbidden"})", 0}};
++  assert(runTimed(8, 8, {}).state == S::Failure);
++  assert(HTTP::sends == 1 && HTTP::insecureCalls == 0);
++  // Snapshot URL/grant/config together; no mixed configuration during clock wait.
++  setup();
++  assert(pluginevents::prepareTimed(8, 8) == 60000000ULL);
++  const auto reads = Storage.reads["/plugins/fixture/device.json"];
++  Storage.files["/plugins/fixture/token.json"] = R"({"token":"other-grant"})";
++  Storage.files["/plugins/fixture/config.json"] = R"({"slot":"other-frame"})";
++  Storage.files["/plugins/fixture/device.json"] = "{}";
++  assert(consumeTimed({}).state == S::Staged);
++  assert(HTTP::lastUrl.find("/frame?token=fixture-token&") != std::string::npos);
++  assert(Storage.reads["/plugins/fixture/device.json"] == reads);
++  assert(consumeTimed({}).state == S::NoHandler && HTTP::sends == 1);
++  pluginevents::refreshSubscriptions();
++  assert(pluginevents::prepareTimed(8, 8) == 0);  // Disabled next cycle.
++  assert(consumeTimed({}).state == S::NoHandler);
++  setup();
++  assert(pluginevents::prepareTimed(8, 8));
++  pluginevents::discardTimed();
++  assert(consumeTimed({}).state == S::NoHandler && HTTP::sends == 0);
++  setup();
++  assert(pluginevents::prepareTimed(8, 8));
++  assert(consumeTimed([] { return true; }).state == S::Failure);
++  assert(consumeTimed({}).state == S::NoHandler && HTTP::sends == 0);
++  setup();
++  Storage.files["/plugins/fixture/ca.pem"] = "not a PEM";
++  assert(pluginevents::prepareTimed(8, 8) == 0 && HTTP::sends == 0);
++  setup();
++  Storage.files.erase("/plugins/fixture/device.json");
++  pluginevents::refreshSubscriptions();
++  assert(pluginevents::prepareTimed(8, 8) == 0);
++  for (const auto& value : {"0", "false", "true", "-1", "59", "86401", "60.0", "\"60\"", "null", "4294967296"}) {
++    std::string invalid = manifest;
++    const auto at = invalid.find("\"interval_seconds\":60,");
++    invalid.replace(at, std::string("\"interval_seconds\":60,").size(),
++                    std::string("\"interval_seconds\":") + value + ",");
++    setup(invalid);
++    assert(pluginevents::prepareTimed(8, 8) == 0 && HTTP::sends == 0);
++  }
++  std::string missingCadence = manifest;
++  const auto cadenceAt = missingCadence.find("\"interval_seconds\":60,");
++  missingCadence.erase(cadenceAt, std::string("\"interval_seconds\":60,").size());
++  setup(missingCadence);
++  assert(pluginevents::prepareTimed(8, 8) == 0);
++  std::string maximumCadence = manifest;
++  maximumCadence.replace(maximumCadence.find("\"interval_seconds\":60,"),
++                         std::string("\"interval_seconds\":60,").size(), "\"interval_seconds\":86400,");
++  setup(maximumCadence);
++  assert(pluginevents::prepareTimed(8, 8) == 86400000000ULL);
++  // Ignored discovery entries cannot conceal a second timer declaration.
++  for (const auto& bad : {std::string("{"), std::string(8193, 'x')}) {
++    setup();
++    PluginLocations::entries.push_back({"broken", "/plugins/broken", false, true, false});
++    Storage.files["/plugins/broken/device.json"] = bad;
++    pluginevents::refreshSubscriptions();
++    assert(pluginevents::prepareTimed(8, 8) == 0);
++    assert(pluginevents::anySubscriber(pluginevents::Event::ReaderSession));
++  }
++  setup();
++  PluginLocations::entries.push_back({std::string(24, 'x'), "/plugins/long", false, true, false});
++  pluginevents::refreshSubscriptions();
++  assert(pluginevents::prepareTimed(8, 8) == 0);
++  setup();
++  for (int i = 0; i < 8; ++i) {
++    const std::string name = "extra" + std::to_string(i), dir = "/plugins/" + name;
++    PluginLocations::entries.push_back({name, dir, false, true, false});
++    Storage.files[dir + "/device.json"] = R"({"events":{"reader.session":{}}})";
++  }
++  pluginevents::refreshSubscriptions();
++  assert(pluginevents::prepareTimed(8, 8) == 0);
++  setup();
++  bool manual = false;
++  HTTP::replies = {{200, bmp(), 10}};
++  assert(runTimed(8, 8, [&] { return manual || freeink::fakeNow > 0; }).state == S::Failure);
++  assert(Storage.files["/sleep.bmp"] == old);
++#endif
++  setup();
++  auto before = Storage.files["/plugins/fixture/events.jsonl"];
++  pluginevents::emit(pluginevents::Event::SleepTimer, nullptr, 0);
++  assert(Storage.files["/plugins/fixture/events.jsonl"] == before);
++  Storage.files["/plugins/fixture/events.jsonl"] = R"({"e":"sleep.timer","vars":{}})"
++                                                   "\n";
++  pluginevents::drain(nullptr, 4);
++  assert(HTTP::sends == 0);
++  assert(!Storage.exists("/plugins/fixture/events.jsonl"));
++  setup("{}");
++  assert(!(pluginevents::prepareTimed(8, 8) != 0));
++  assert(runTimed(8, 8, {}).state == S::NoHandler);
++  setup();
++  assert(!(pluginevents::prepareTimed(9, 8) != 0));
++  assert(runTimed(9, 8, {}).state == S::Failure);
++  assert(HTTP::sends == 0);
++  setup();
++  PluginLocations::entries.push_back({"second", "/plugins/second", false, true, false});
++  Storage.files["/plugins/second/device.json"] = manifest;
++  pluginevents::refreshSubscriptions();
++  assert(!(pluginevents::prepareTimed(8, 8) != 0));
++  assert(runTimed(8, 8, {}).state == S::Failure);
++  assert(HTTP::sends == 0);
++  setup();
++  std::string insecure = manifest;
++  const auto tls = insecure.find(",\"tls\":{\"ca_file\":\"ca.pem\"}");
++  assert(tls != std::string::npos);
++  insecure.erase(tls, std::string(",\"tls\":{\"ca_file\":\"ca.pem\"}").size());
++  setup(insecure);
++  assert(!(pluginevents::prepareTimed(8, 8) != 0));
++  assert(runTimed(8, 8, {}).state == S::Failure);
++  assert(HTTP::sends == 0);
++}
+--- /dev/null
++++ b/test/timed_sync/real_tls.py
+@@ -0,0 +1,66 @@
++#!/usr/bin/env python3
++"""Compose the actual timer caller, SDK TLS and BMP decoding on loopback."""
++import argparse
++import json
++from pathlib import Path
++import subprocess
++import sys
++import tempfile
++
++root = Path(__file__).resolve().parents[2]
++here = Path(__file__).resolve().parent
++tls = root / 'test/plugin_verified_tls'
++sys.path.insert(0, str(tls))
++from tls_fixture import LoopbackTLS, issue, pem_cert, pem_key
++
++parser = argparse.ArgumentParser(description=__doc__)
++parser.add_argument('--wolf-root', type=Path, required=True)
++parser.add_argument('--wolf-archive', type=Path, required=True)
++parser.add_argument('--arduinojson', type=Path, required=True)
++parser.add_argument('--output', type=Path, required=True)
++args = parser.parse_args()
++flags = ['-std=c++20', '-O0', '-w', '-DFREEINK_NET_WOLFSSL=1', '-DWOLFSSL_USER_SETTINGS',
++         '-DWOLFSSL_OPTIONS_H', '-DWOLFSSL_CLIENT_EXAMPLE', '-DWOLFSSL_TLS13',
++         '-DWOLFSSL_HAVE_SP_ECC', '-DWOLFSSL_SP_SMALL', '-DHAVE_CURVE25519', '-DHAVE_SNI']
++sdk = root / 'freeink-sdk/libs/network/SecureNet'
++results = []
++with tempfile.TemporaryDirectory(prefix='timed-real-tls-') as directory:
++    temp = Path(directory)
++    command = ['nice', '-n', '10', 'c++', *flags]
++    for path in [tls/'transport_stubs', sdk/'include', args.wolf_root/'src', here/'stubs',
++                 root/'test/plugin_verified_http/stubs', root/'test/plugin_event_budget/stubs',
++                 args.arduinojson, root/'src', root/'lib/GfxRenderer', root/'lib/Memory']:
++        command += ['-I', str(path)]
++    sources = [sdk/'src/SecureClient.cpp', root/'src/util/PluginHttp.cpp', root/'src/util/PluginEvents.cpp',
++               root/'src/util/PluginEventAsset.cpp', root/'src/util/TimedSleepPaint.cpp',
++               root/'lib/GfxRenderer/Bitmap.cpp', root/'lib/GfxRenderer/BitmapHelpers.cpp', here/'RealTlsTest.cpp']
++    executable = temp/'check'
++    subprocess.run([*command, *map(str,sources), str(args.wolf_archive), '-o', str(executable)], check=True)
++    image = bytearray(94); image[:2] = b'BM'
++    for at, value in [(2,94),(10,62),(14,40),(18,8),(22,8)]: image[at:at+4] = value.to_bytes(4,'little')
++    image[26] = image[28] = 1; image[58:61] = b'\xff\xff\xff'
++    frame = temp/'frame.bmp'; frame.write_bytes(image)
++    key, ca = issue('Test root', ca=True)
++    ca_path = temp/'root.pem'; ca_path.write_bytes(pem_cert(ca))
++    for name, san, body, status, expected in [
++        ('delivered', 'good.test', bytes(image), 200, True),
++        ('invalid-bmp', 'good.test', b'bad BMP', 200, False),
++        ('revoked', 'good.test', b'revoked', 401, False),
++        ('wrong-host', 'wrong.test', bytes(image), 200, False),
++    ]:
++        leaf_key, leaf = issue('leaf', key, ca, san)
++        cert, secret = temp/'leaf.pem', temp/'leaf.key'
++        cert.write_bytes(pem_cert(leaf)); secret.write_bytes(pem_key(leaf_key))
++        with LoopbackTLS(cert, secret, payload=body, status=status) as server:
++            process = subprocess.run([str(executable), str(server.port), str(ca_path), str(frame)],
++                                     capture_output=True, text=True, timeout=15)
++        assert process.returncode == 0, process.stderr
++        result = json.loads(process.stdout)
++        assert result == {'armed_us':60000000, 'painted':expected, 'paints':int(expected),
++                          'old_preserved':not expected, 'private_unchanged':True}, (name,result)
++        assert (b'TEST-ONLY-TOKEN' in server.data) == (name != 'wrong-host'), name
++        results.append({'case':name,'status':'PASS','observed':result})
++args.output.write_text(json.dumps({'status':'PASS','cases':results,
++    'boundary':'actual timer manifest/transport/BMP decode; controlled clock/SD/Gfx and POSIX loopback',
++    'device':'NOT_TESTED'},indent=2)+'\n')
++print('TIMED -> real SDK TLS -> BMP decode/commit/panel-call: 4 cases PASS')
+--- /dev/null
++++ b/test/timed_sync/run.py
+@@ -0,0 +1,87 @@
++"""Production timer selection, verified fetch/commit and silent paint at host boundaries."""
++from pathlib import Path
++import os
++import sys
++import subprocess, tempfile
++root=Path(__file__).resolve().parents[2]
++here=Path(__file__).resolve().parent
++includes=[here/'stubs', root/'test/plugin_event_budget/stubs', root/'test/plugin_verified_http/stubs',
++          Path(os.environ['CROSSPOINT_ARDUINOJSON_INCLUDE']) if 'CROSSPOINT_ARDUINOJSON_INCLUDE' in os.environ else root/'.pio/libdeps/x4pro/ArduinoJson/src', root/'src', root/'lib/GfxRenderer',root/'lib/Memory']
++common=['c++','-std=c++20','-O0','-Wall','-Wextra']
++sanitize=['-fsanitize=address,undefined','-fno-omit-frame-pointer'] if '--sanitize' in sys.argv else []
++common+=sanitize
++for path in includes: common+=['-I',str(path)]
++asset=[root/'src/util/PluginEventAsset.cpp',root/'lib/GfxRenderer/Bitmap.cpp',root/'lib/GfxRenderer/BitmapHelpers.cpp']
++with tempfile.TemporaryDirectory(prefix='timed-sync-') as tmp:
++    for name,flags in [('older-sdk',[]),('backend-disabled',['-DTEST_SDK_CAPABILITY','-DTEST_PEER_VERIFICATION_AVAILABLE=0']),('verified-sdk',['-DTEST_SDK_CAPABILITY','-DTEST_PEER_VERIFICATION_AVAILABLE=1'])]:
++        exe=Path(tmp)/name
++        subprocess.run(common+flags+[str(p) for p in asset]+[str(root/'src/util/PluginEvents.cpp'),
++                       str(root/'src/util/PluginHttp.cpp'),str(here/'TimedSyncTest.cpp'),'-o',str(exe)],check=True)
++        subprocess.run([str(exe)],check=True)
++        print(name,'PASS')
++    exe=Path(tmp)/'paint'
++    subprocess.run(common+[str(p) for p in asset]+[str(root/'src/util/TimedSleepPaint.cpp'),str(here/'PaintTest.cpp'),'-o',str(exe)],check=True)
++    subprocess.run([str(exe)],check=True)
++    print('silent paint production caller / Bitmap rows PASS; Gfx/EPD stubbed')
++    main=(root/'src/main.cpp').read_text()
++    body=main[main.index('static uint64_t prepareTimerPanel() {'):main.index('void setup() {')]
++    (Path(tmp)/'TimerPanelSource.inc').write_text(body)
++    start=main.index('  struct TimerBootHooks {')
++    end=main.index('} timerHooks;',start)+len('} timerHooks;')
++    (Path(tmp)/'TimerBootHooksSource.inc').write_text(main[start:end])
++    exe=Path(tmp)/'boot-io'
++    subprocess.run(['c++','-std=c++20','-O0',*sanitize,'-I',tmp,'-I',str(root/'src'),'-I',str(root/'lib/hal'),str(here/'BootIoTest.cpp'),'-o',str(exe)],check=True)
++    subprocess.run([str(exe)],check=True)
++    print('exact production timer I/O orchestration PASS (WiFi/EPD boundaries stubbed)')
++    gpio=(root/'lib/hal/HalGPIO.cpp').read_text()
++    capture=gpio[gpio.index('void IRAM_ATTR HalGPIO::capturePowerPress'):gpio.index('bool HalGPIO::verifyPowerButtonWakeup()')]
++    (Path(tmp)/'PowerCaptureSource.inc').write_text(capture)
++    exe=Path(tmp)/'power-capture'
++    subprocess.run(['c++','-std=c++20','-O0',*sanitize,'-I',tmp,str(here/'PowerCaptureTest.cpp'),'-o',str(exe)],check=True)
++    subprocess.run([str(exe)],check=True)
++    print('production HAL Power capture / pulse, polarity, cleanup and failure paths PASS')
++
++# SOURCE wiring only; no full Arduino setup or real WiFi/EPD execution.
++main=(root/'src/main.cpp').read_text()
++body=main[main.index('static uint64_t prepareTimerPanel() {'):main.index('void setup() {')]
++narrow=body[:body.index('static void returnToTimerStandby() {')]
++for bad in ['APP_STATE.','SETTINGS.','activityManager.','GUI.','Frontlight.','pluginevents::drain','pluginevents::emit']:
++    assert bad not in narrow,bad
++assert body.index('pluginevents::prepareTimed')<body.index('WiFi.begin')
++assert body.index('pluginevents::timedSync')<body.index('setupBitmapDisplay(false)')
++assert 'static_cast<uint32_t>(millis() - joinedAt)' in body
++assert 'BoardConfig::ACTIVE.displayHeight' in body and 'BoardConfig::ACTIVE.displayWidth' in body
++print('timer boot narrow wiring PASS (SOURCE only)')
++
++initializer=main[main.index('static void setupBitmapDisplay'):main.index('void setupDisplayAndFonts')]
++assert initializer.index('if (timerDisplayReady) return')<initializer.index('display.begin')
++assert 'if (!timerStorageReady && !Storage.begin())' in main
++
++assert 'wakeupReason == HalGPIO::WakeupReason::Timer && timerHooks.manualPower' in main
++assert 'timedwake::consumeManualWake(resetReason, timerManualWakeStamp)' in main
++assert 'const bool powerWake = wakeupReason == HalGPIO::WakeupReason::PowerButton || manualTimerWake' in main
++assert 'const bool wakeHoldVerified = !powerWake || gpio.verifyPowerButtonWakeup()' in main
++assert 'const bool recoveryFirmwareMode =' in main and 'powerWake && !BoardConfig::isPaperMono()' in main
++assert 'timedwake::acceptManualWake(wakeHoldVerified,' in main
++assert 'if (manualTimerWake) returnToTimerStandby();' in main
++standby=main[main.index('static void returnToTimerStandby() {'):main.index('void setup() {')]
++assert standby.index('prepareTimerPanel()') < standby.index('pluginevents::discardTimed()')
++assert standby.index('Frontlight.setOn(false)') < standby.index('halTiltSensor.deepSleep()') < standby.index('display.deepSleep()')
++assert standby.index('display.deepSleep()') < standby.index('Storage.prepareForDeepSleep()') < standby.index('powerManager.startDeepSleep(gpio, interval, true)')
++assert 'APP_STATE.' not in standby and 'SETTINGS.' not in standby
++
++# Runtime opt-in is read before ordinary SD shutdown; manual boot discards context.
++sleep=main[main.index('void enterDeepSleep('):main.index('static bool timerStorageReady')]
++assert sleep.index('prepareTimerPanel()') < sleep.index('Storage.prepareForDeepSleep()')
++assert sleep.index('pluginevents::discardTimed()') < sleep.index('Storage.prepareForDeepSleep()')
++setup=main[main.index('void setup() {'):main.index('void loop() {')]
++assert setup.index('timedwake::handleBoot(')<setup.index('pluginevents::discardTimed();',setup.index('timedwake::handleBoot('))<setup.index('APP_STATE.loadFromFile()')
++assert 'CROSSPOINT_LAB_TIMER_INTERVAL_US' not in main+(root/'src/util/TimedWakeGuard.h').read_text()
++assert body.count('trustedtime::syncFresh(') == 1
++assert 'waitForValidClock' not in body and 'trustedtime::startSync(' not in body
++assert body.index('DrainBudget budget(') < body.index('trustedtime::syncFresh(') < body.index('pluginevents::timedSync(budget,')
++
++assert 'gpio.beginPowerPressCapture()' in setup
++assert 'isSilentReboot || rebootedFromPanic || !timerPowerCaptureReady' in setup
++assert setup.index('gpio.endPowerPressCapture()') < setup.index('APP_STATE.loadFromFile()')
++assert 'gpio.powerPressCaptured()' in narrow
+--- /dev/null
++++ b/test/timed_sync/stubs/GfxRenderer.h
+@@ -0,0 +1,27 @@
++#pragma once
++#include <Bitmap.h>
++
++#include <vector>
++struct HalDisplay {
++  enum RefreshMode { HALF_REFRESH };
++};
++class GfxRenderer {
++ public:
++  enum RenderMode { BW };
++  int width = 8, height = 8, paints = 0, clears = 0, draws = 0;
++  bool failDraw = false;
++  int getScreenWidth() const { return width; }
++  int getScreenHeight() const { return height; }
++  void setRenderMode(RenderMode) {}
++  void clearScreen() { ++clears; }
++  // EPD/Gfx boundary stub: decode rows through the production Bitmap; real
++  // transform/framebuffer/driver transfer requires the later DEVICE trial.
++  bool drawBitmap(const Bitmap& bitmap, int, int, int, int) {
++    ++draws;
++    std::vector<uint8_t> pixels((bitmap.getWidth() + 3) / 4), raw(bitmap.getRowBytes());
++    for (int y = 0; y < bitmap.getHeight(); ++y)
++      if (bitmap.readNextRow(pixels.data(), raw.data()) != BmpReaderError::Ok) return false;
++    return !failDraw;
++  }
++  void displayBuffer(HalDisplay::RefreshMode) { ++paints; }
++};
+--- /dev/null
++++ b/test/timed_sync/stubs/HalStorage.h
+@@ -0,0 +1,94 @@
++#pragma once
++#include <WString.h>
++#include <fcntl.h>
++
++#include <cstdint>
++#include <functional>
++#include <string>
++#include <unordered_map>
++struct HalFile {
++  std::string* data = nullptr;
++  size_t pos = 0;
++  size_t readStop = SIZE_MAX;
++  bool seek(uint64_t n) {
++    if (!data || n > data->size()) return false;
++    pos = n;
++    return true;
++  }
++  bool seekCur(int64_t n) { return seek(pos + n); }
++  int read() {
++    return !data || pos >= data->size() || pos >= readStop ? -1 : static_cast<unsigned char>((*data)[pos++]);
++  }
++  size_t read(void* out, size_t count) {
++    auto* b = static_cast<uint8_t*>(out);
++    size_t n = 0;
++    for (; n < count; ++n) {
++      int c = read();
++      if (c < 0) break;
++      b[n] = c;
++    }
++    return n;
++  }
++  bool isOpen() const { return data != nullptr; }
++  explicit operator bool() const { return isOpen(); }
++  size_t write(const char* p, size_t n) {
++    if (!data) return 0;
++    data->append(p, n);
++    return n;
++  }
++  size_t write(const uint8_t* p, size_t n) { return write(reinterpret_cast<const char*>(p), n); }
++  void flush() {}
++  void close() { data = nullptr; }
++  uint64_t fileSize64() const { return data ? data->size() : 0; }
++  size_t fileSize() const { return static_cast<size_t>(fileSize64()); }
++  void truncate(uint64_t n) {
++    if (data) data->resize(n);
++  }
++};
++struct StorageStub {
++  std::unordered_map<std::string, std::string> files;
++  std::unordered_map<std::string, size_t> reads;
++  std::string failRead, failRenameFrom, failRenameTo, failRemove;
++  std::function<void()> afterRename;
++  bool failWrite = false;
++  size_t readStop = SIZE_MAX;
++  bool openFileForRead(const char*, const std::string& path, HalFile& out) {
++    auto it = files.find(path);
++    if (it == files.end() || path == failRead) return false;
++    out.data = &it->second;
++    out.pos = 0;
++    out.readStop = readStop;
++    return true;
++  }
++  bool readFileToString(const char*, const std::string& path, size_t cap, std::string& out) {
++    ++reads[path];
++    const auto it = files.find(path);
++    if (it == files.end() || it->second.size() > cap) return false;
++    out = it->second;
++    return true;
++  }
++  bool openFileForWrite(const char*, const std::string& path, HalFile& f) {
++    if (failWrite) return false;
++    files[path].clear();
++    f.data = &files[path];
++    return true;
++  }
++  bool openFileForWrite(const char* t, const char* p, HalFile& f) { return openFileForWrite(t, std::string(p), f); }
++  HalFile open(const char* path, int) { return HalFile{&files[path]}; }
++  bool remove(const char* path) { return failRemove == path ? false : files.erase(path) != 0; }
++  bool exists(const char* path) const { return files.find(path) != files.end(); }
++  bool rename(const char* from, const char* to) {
++    if (failRenameFrom == from || failRenameTo == to) return false;
++    auto it = files.find(from);
++    if (it == files.end() || exists(to)) return false;
++    files[to] = it->second;
++    files.erase(it);
++    if (afterRename) afterRename();
++    return true;
++  }
++  bool writeFile(const char* path, const String& value) {
++    files[path] = value.value;
++    return true;
++  }
++};
++inline StorageStub Storage;
+--- /dev/null
++++ b/test/timed_sync/stubs/SecureHttpClient.h
+@@ -0,0 +1,58 @@
++#pragma once
++#include <cstdint>
++#include <functional>
++#include <string>
++#include <utility>
++#include <vector>
++namespace freeink {
++inline uint32_t fakeNow = 0;
++class SecureHttpClient {
++ public:
++#ifdef TEST_SDK_CAPABILITY
++  static bool peerVerificationAvailable() { return TEST_PEER_VERIFICATION_AVAILABLE != 0; }
++#endif
++  using DataCallback = std::function<bool(const uint8_t*, size_t)>;
++  using AbortCallback = std::function<bool()>;
++  struct Reply {
++    int status;
++    std::string body;
++    uint32_t delayMs;
++  };
++  static inline std::vector<Reply> replies;
++  static inline size_t sends = 0;
++  static inline bool aborted = false;
++  static inline int insecureCalls = 0, caCalls = 0;
++  static inline bool beginOk = true;
++  static inline std::string lastUrl;
++  void setUserAgent(const char*) {}
++  void setInsecure() { ++insecureCalls; }
++  void setCACert(const char*) { ++caCalls; }
++  void setTimeout(uint32_t) {}
++  void setFollowRedirects(int hops) {
++    if (hops != 0) __builtin_trap();
++  }
++  bool begin(const std::string& url) {
++    lastUrl = url;
++    return beginOk;
++  }
++  void addHeader(const std::string&, const std::string&) {}
++  int sendRequest(const char*, const uint8_t*, size_t, const DataCallback& onData,
++                  const AbortCallback& shouldAbort = nullptr) {
++    if (sends >= replies.size()) return -1;
++    const Reply r = replies[sends++];
++    if (shouldAbort && shouldAbort()) {
++      aborted = true;
++      return -1;
++    }
++    fakeNow += r.delayMs;
++    if (shouldAbort && shouldAbort()) {
++      aborted = true;
++      return -1;
++    }
++    if (!r.body.empty() && !onData(reinterpret_cast<const uint8_t*>(r.body.data()), r.body.size())) return -1;
++    return r.status;
++  }
++  bool responseComplete() const { return !aborted; }
++  std::vector<std::pair<std::string, std::string>> getHeaders() const { return {}; }
++};
++}  // namespace freeink
+--- /dev/null
++++ b/test/timed_sync/stubs/components/UITheme.h
+@@ -0,0 +1,7 @@
++#pragma once
++#include <GfxRenderer.h>
++struct FixtureGUI {
++  inline static int popups = 0;
++  void drawPopup(GfxRenderer&, const char*) { ++popups; }
++};
++inline FixtureGUI GUI;
+--- /dev/null
++++ b/test/timed_wake_guard/GuardTest.cpp
+@@ -0,0 +1,229 @@
++#include <cassert>
++#include <cstdint>
++#include <cstdio>
++#include <string>
++
++#include "TimerWakeArm.h"
++#include "util/TimedWakeGuard.h"
++
++#ifndef TEST_TIMER_INTERVAL_US
++#define TEST_TIMER_INTERVAL_US 0
++#endif
++constexpr uint64_t TEST_INTERVAL = TEST_TIMER_INTERVAL_US;
++namespace {
++struct Reset {};
++struct Slept {};
++int armCalls, disableCalls, resetCalls, gpioArms, releaseWaits, sleeps;
++int armError, disableError;
++bool timerEnabled;
++uint64_t armedInterval;
++void clear() {
++  armCalls = disableCalls = resetCalls = gpioArms = releaseWaits = sleeps = 0;
++  armError = disableError = 0;
++  timerEnabled = false;
++  armedInterval = 0;
++}
++struct Hooks {
++  int checks = 0, pressAt = 0, batteryReads = 0;
++  int syncCalls = 0, prepareCalls = 0;
++  uint64_t configured = TEST_INTERVAL;
++  uint16_t battery = 80;
++  uint64_t interval = 99;
++  // Sentinels represent caller-owned state; the production guard has no route
++  // to write these or to invoke a renderer/network/storage operation.
++  const std::string readerState = "book.epub:chapter7:42%";
++  const std::string pixels = "retained sleep frame";
++  bool powerPressed() { return ++checks == pressAt; }
++  uint16_t batteryPercent() {
++    ++batteryReads;
++    return battery;
++  }
++  uint64_t prepare() {
++    ++prepareCalls;
++    return configured;
++  }
++  void sync() { ++syncCalls; }
++  void sleep(uint64_t value) {
++    interval = value;
++    timerwakearm::arm(value);
++    timerwakearm::sleep(true);
++  }
++};
++using W = wakeup::Reason;
++constexpr timedwake::Boot TIMER{W::Timer, wakeup::RST_DEEPSLEEP, true, false};
++bool run(timedwake::Boot boot, Hooks& hooks) {
++  try {
++    return timedwake::handleBoot(boot, hooks);
++  } catch (const Slept&) {
++    return true;
++  }
++}
++void classification() {
++  using wakeup::classify;
++  assert(classify(wakeup::WAKEUP_TIMER, wakeup::RST_DEEPSLEEP, false, true) == W::Timer);
++  assert(classify(wakeup::WAKEUP_TIMER, wakeup::RST_DEEPSLEEP, true, false) == W::Timer);
++  assert(classify(wakeup::WAKEUP_GPIO, wakeup::RST_DEEPSLEEP, false, true) == W::PowerButton);
++  assert(classify(wakeup::WAKEUP_EXT1, wakeup::RST_DEEPSLEEP, true, false) == W::PowerButton);
++  assert(classify(wakeup::WAKEUP_UNDEFINED, wakeup::RST_POWERON, false, true) == W::PowerButton);
++  assert(classify(wakeup::WAKEUP_UNDEFINED, wakeup::RST_POWERON, false, false) == W::Other);
++  assert(classify(wakeup::WAKEUP_UNDEFINED, wakeup::RST_POWERON, true, true) == W::AfterUSBPower);
++  assert(classify(wakeup::WAKEUP_UNDEFINED, wakeup::RST_UNKNOWN, true, true) == W::AfterFlash);
++  assert(classify(wakeup::WAKEUP_TIMER, wakeup::RST_SW, false, true) == W::Other);
++  assert(classify(wakeup::WAKEUP_UNDEFINED, wakeup::RST_DEEPSLEEP, false, true) == W::Other);
++}
++}  // namespace
++
++int esp_sleep_enable_timer_wakeup(uint64_t interval) {
++  ++armCalls;
++  armedInterval = interval;
++  timerEnabled = true;  // Even a failed arm may leave an earlier source enabled.
++  return armError;
++}
++int esp_sleep_disable_wakeup_source(int source) {
++  assert(source == ESP_SLEEP_WAKEUP_TIMER);
++  ++disableCalls;
++  if (disableError == ESP_OK || disableError == ESP_ERR_INVALID_STATE) timerEnabled = false;
++  return disableError;
++}
++[[noreturn]] void esp_restart() {
++  ++resetCalls;
++  timerEnabled = false;
++  throw Reset{};
++}
++bool freeink::PowerManager::armPowerButtonWakeup() {
++  ++gpioArms;
++  return true;
++}
++[[noreturn]] void freeink::PowerManager::deepSleep() {
++  ++sleeps;
++  throw Slept{};
++}
++[[noreturn]] void freeink::PowerManager::deepSleepUntilPowerButton() {
++  ++releaseWaits;
++  armPowerButtonWakeup();
++  deepSleep();
++}
++
++int main() {
++  uint32_t stamp = timedwake::MANUAL_WAKE_STAMP;
++  assert(timedwake::consumeManualWake(wakeup::RST_SW, stamp) && stamp == 0);
++  assert(!timedwake::consumeManualWake(wakeup::RST_SW, stamp));
++  stamp = timedwake::MANUAL_WAKE_STAMP;
++  assert(!timedwake::consumeManualWake(wakeup::RST_POWERON, stamp) && stamp == 0);
++  stamp = 0xffffffff;
++  assert(!timedwake::consumeManualWake(wakeup::RST_SW, stamp) && stamp == 0);
++
++  classification();
++  // A latched short tap can release before settings load. Click-wake accepts
++  // it; hold-to-wake requires the existing stable hold verification.
++  assert(timedwake::acceptManualWake(false, true));
++  assert(!timedwake::acceptManualWake(false, false));
++  assert(timedwake::acceptManualWake(true, false));
++  clear();
++  Hooks first;
++  assert(run(TIMER, first));
++  assert(first.interval == TEST_INTERVAL);
++  assert(first.batteryReads == (TEST_INTERVAL ? 2 : 1));
++  assert(first.syncCalls == (TEST_INTERVAL ? 1 : 0));
++  assert(armCalls == (TEST_INTERVAL ? 1 : 0));
++  assert(sleeps == 1 && gpioArms == 1 && releaseWaits == 0);
++  assert(first.readerState == "book.epub:chapter7:42%" && first.pixels == "retained sleep frame");
++
++  clear();
++  timerEnabled = true;
++  Hooks deleted;
++  deleted.configured = 0;
++  assert(run(TIMER, deleted));
++  assert(deleted.interval == 0 && deleted.syncCalls == 0 && !timerEnabled && disableCalls == 1);
++  // A second reset/cycle rearms through the same primitive, not a running scheduler.
++  Hooks second;
++  assert(run(TIMER, second));
++  assert(sleeps == 2 && releaseWaits == 0);
++
++  for (auto reason : {W::PowerButton, W::AfterFlash, W::AfterUSBPower, W::Other}) {
++    clear();
++    Hooks h;
++    assert(!run({reason, wakeup::RST_DEEPSLEEP, true, false}, h));
++    assert(h.checks == 0 && armCalls == 0 && sleeps == 0);
++  }
++  for (int reset : {wakeup::RST_SW, wakeup::RST_UNKNOWN, wakeup::RST_POWERON}) {
++    clear();
++    Hooks h;
++    assert(!run({W::Timer, reset, true, false}, h));
++    assert(sleeps == 0);
++  }
++  for (int pressAt : {1, 2}) {
++    clear();
++    Hooks h;
++    h.pressAt = pressAt;
++    assert(!run(TIMER, h));
++    assert(sleeps == 0 && armCalls == 0);  // Power before or during battery read wins.
++  }
++  for (auto boot : {timedwake::Boot{W::Timer, wakeup::RST_DEEPSLEEP, false, false},
++                    timedwake::Boot{W::Timer, wakeup::RST_DEEPSLEEP, true, true}}) {
++    clear();
++    timerEnabled = true;
++    Hooks h;
++    assert(run(boot, h));
++    assert(h.interval == 0 && h.batteryReads == 0 && h.prepareCalls == 0 && armCalls == 0 && sleeps == 1);
++    assert(!timerEnabled && disableCalls == 1 && resetCalls == 0);
++  }
++  if (TEST_INTERVAL) {
++    clear();
++    Hooks duringSync;
++    duringSync.pressAt = 3;
++    assert(!run(TIMER, duringSync));
++    assert(duringSync.syncCalls == 1 && sleeps == 0 && armCalls == 0);
++  }
++  clear();
++  timerEnabled = true;
++  Hooks low;
++  low.battery = 19;
++  assert(run(TIMER, low));
++  assert(low.interval == 0 && low.prepareCalls == 0 && armCalls == 0 && sleeps == 1);
++  assert(!timerEnabled && disableCalls == 1 && resetCalls == 0);
++  assert(timedwake::sleepInterval(TEST_INTERVAL, false, 100) == 0);
++  assert(timedwake::sleepInterval(TEST_INTERVAL, true, 19) == 0);
++  assert(timedwake::sleepInterval(TEST_INTERVAL, true, 20) == TEST_INTERVAL);
++
++  clear();
++  timerEnabled = true;
++  assert(!timerwakearm::arm(0));
++  assert(armCalls == 0 && disableCalls == 1 && !timerEnabled);
++  clear();
++  disableError = ESP_ERR_INVALID_STATE;  // Already inactive is a safe result.
++  assert(!timerwakearm::arm(0));
++  assert(!timerEnabled && disableCalls == 1 && resetCalls == 0);
++  clear();
++  assert(timerwakearm::arm(60000000));
++  assert(timerEnabled && armedInterval == 60000000);
++  clear();
++  armError = -1;
++  timerEnabled = true;
++  assert(!timerwakearm::arm(60000000));
++  assert(!timerEnabled && armCalls == 1 && disableCalls == 1 && resetCalls == 0);
++  try {
++    timerwakearm::sleep(true);
++  } catch (const Slept&) {
++  }
++  assert(sleeps == 1 && releaseWaits == 0 && !timerEnabled);  // Button-only, no retry.
++  clear();
++  armError = disableError = -1;
++  try {
++    timerwakearm::arm(60000000);
++    assert(false);
++  } catch (const Reset&) {
++  }
++  assert(resetCalls == 1 && sleeps == 0 && armCalls == 1 && disableCalls == 1);
++  Hooks afterAbort;
++  assert(!run({wakeup::classify(wakeup::WAKEUP_TIMER, wakeup::RST_SW, false, true), wakeup::RST_SW, true, false},
++              afterAbort));
++  assert(sleeps == 0);  // SDK sleep abort and cleanup restart are not timer loops.
++  clear();
++  try {
++    timerwakearm::sleep(false);
++  } catch (const Slept&) {
++  }
++  assert(releaseWaits == 1 && gpioArms == 1 && sleeps == 1);  // Existing normal helper.
++  std::puts(TEST_INTERVAL ? "lab-enabled guard/arm checks passed" : "default-disabled guard/arm checks passed");
++}
+--- /dev/null
++++ b/test/timed_wake_guard/run.py
+@@ -0,0 +1,42 @@
++"""Compile the production timer caller/arming path at O0 with default and lab configs."""
++from pathlib import Path
++import subprocess
++import sys
++import tempfile
++
++root = Path(__file__).resolve().parents[2]
++here = Path(__file__).resolve().parent
++sanitize = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"] if "--sanitize" in sys.argv else []
++with tempfile.TemporaryDirectory(prefix="timed-wake-guard-") as tmp:
++    for name, flags in [("default", []), ("lab", ["-DTEST_TIMER_INTERVAL_US=60000000ULL"])]:
++        binary = Path(tmp) / name
++        subprocess.run(["c++", "-std=c++20", "-O0", "-Wall", "-Wextra", "-Werror", *sanitize, *flags,
++                        "-I", str(here / "stubs"), "-I", str(root / "lib/hal"),
++                        "-I", str(root / "src"), str(here / "GuardTest.cpp"), "-o", str(binary)], check=True)
++        subprocess.run([str(binary)], check=True)
++
++# Wiring checks complement the compiled production caller. They are source
++# evidence; they do not execute Arduino setup or emulate the physical panel.
++main = (root / "src/main.cpp").read_text()
++setup = main[main.index("void setup() {"):main.index("void loop() {")]
++route = setup.index("timedwake::handleBoot(")
++for later in ["Storage.begin()", "APP_STATE.loadFromFile()", "Frontlight.begin(", "setupDisplayAndFonts("]:
++    assert route < setup.index(later), later
++hooks = setup[setup.index("struct TimerBootHooks"):route]
++for forbidden in ["APP_STATE", "renderer.", "WiFi."]:
++    # Comments may explain the absence of APP_STATE writes.
++    code = "\n".join(line for line in hooks.splitlines() if not line.lstrip().startswith("//"))
++    assert forbidden not in code, forbidden
++assert "prepareTimerPanel()" in hooks
++assert "syncTimerPanel()" in hooks
++assert "powerManager.startDeepSleep(gpio, intervalUs, true)" in hooks
++assert "powerManager.startDeepSleep(gpio);" in main
++hal = (root / "lib/hal/HalPowerManager.cpp").read_text()
++assert "timerwakearm::sleep(fromTimerWake)" in hal
++assert "freeink::PowerManager::powerDownRailsForSleep()" in hal
++assert "freeink::m5pm1::requestShutdown()" in hal
++assert "freeink::metalio::powerOff()" in hal
++assert "BoardConfig::isSticky() || BoardConfig::isX4Pro()" in main
++assert "keepX4PoweredForTimer" in hal  # Preserve the timer primitive's C3 policy.
++assert "takeAbortedSleepInfo" not in main + hal
++print("Timer guard main/HAL wiring checks passed (SOURCE only)")
+--- /dev/null
++++ b/test/timed_wake_guard/stubs/HalGPIO.h
+@@ -0,0 +1,5 @@
++#pragma once
++#include <WakeupClassify.h>
++struct HalGPIO {
++  using WakeupReason = wakeup::Reason;
++};
+--- /dev/null
++++ b/test/timed_wake_guard/stubs/Logging.h
+@@ -0,0 +1,2 @@
++#pragma once
++#define LOG_ERR(...) ((void)0)
+--- /dev/null
++++ b/test/timed_wake_guard/stubs/PowerManager.h
+@@ -0,0 +1,8 @@
++#pragma once
++namespace freeink {
++struct PowerManager {
++  static bool armPowerButtonWakeup();
++  [[noreturn]] static void deepSleep();
++  [[noreturn]] static void deepSleepUntilPowerButton();
++};
++}  // namespace freeink
+--- /dev/null
++++ b/test/timed_wake_guard/stubs/esp_sleep.h
+@@ -0,0 +1,7 @@
++#pragma once
++#include <cstdint>
++inline constexpr int ESP_OK = 0;
++inline constexpr int ESP_ERR_INVALID_STATE = 0x103;
++inline constexpr int ESP_SLEEP_WAKEUP_TIMER = 4;
++int esp_sleep_enable_timer_wakeup(uint64_t);
++int esp_sleep_disable_wakeup_source(int);
+--- /dev/null
++++ b/test/timed_wake_guard/stubs/esp_system.h
+@@ -0,0 +1,4 @@
++#pragma once
++using esp_reset_reason_t = int;
++inline constexpr int ESP_RST_DEEPSLEEP = 8;
++[[noreturn]] void esp_restart();
+--- a/test/timer_wake_arm/TimerWakeArmTest.cpp
++++ b/test/timer_wake_arm/TimerWakeArmTest.cpp
+@@ -51,9 +51,10 @@
+ } logSerial;
+ struct HalGPIO {
+   bool isXteinkDevice() const { return true; }
++  bool powerPressCaptured() const { return false; }
+ };
+ struct HalPowerManager {
+-  void startDeepSleep(HalGPIO&, uint64_t = 0) const;
++  void startDeepSleep(HalGPIO&, uint64_t = 0, bool = false) const;
+ };
+ namespace BoardConfig {
+ enum class Board { XteinkX4, XteinkX3 };
+@@ -77,6 +78,8 @@
+ namespace freeink {
+ struct PowerManager {
+   static void powerDownRailsForSleep() { trace.push_back("rails-down"); }
++  static void armPowerButtonWakeup() {}
++  [[noreturn]] static void deepSleep() { deepSleepUntilPowerButton(); }
+   [[noreturn]] static void deepSleepUntilPowerButton() {
+     trace.push_back("sleep");
+     throw Slept{};
+@@ -114,8 +117,8 @@
+ int main(int argc, char**) {
+   if (argc > 1) return rejectedRequest() ? 0 : 42;
+   reset();
+-  assert(sleep(0) && armCalls == 0 && clearCalls == 0 && errors.empty());
+-  assert(trace == std::vector<std::string>({"serial-end", "rails-down", "sleep"}));
++  assert(sleep(0) && armCalls == 0 && clearCalls == 1 && errors.empty());
++  assert(trace == std::vector<std::string>({"clear", "serial-end", "rails-down", "sleep"}));
+   assert(latchWrites == (SOC_PM_SUPPORT_EXT1_WAKEUP ? 0 : 1));
+   assert(SOC_PM_SUPPORT_EXT1_WAKEUP || latchLevel == LOW);
+   reset();
+--- a/test/timer_wake_arm/run.py
++++ b/test/timer_wake_arm/run.py
+@@ -29,8 +29,13 @@
+             ["git", "show", baseline + ":lib/hal/HalPowerManager.cpp"], cwd=root, text=True
+         )
+         variants.append(("original", original))
++    helper = (root / "lib/hal/TimerWakeArm.h").read_text()
++    helper = helper[helper.index("namespace timerwakearm {"):]
+     for name, source in variants:
+-        (temp / "SleepSource.inc").write_text(function(source))
++        body = function(source)
++        if name == "original":
++            body = body.replace("uint64_t timerWakeUs)", "uint64_t timerWakeUs, bool)")
++        (temp / "SleepSource.inc").write_text(helper + "\n" + body)
+         for ext1 in (0, 1):
+             executable = temp / (name + str(ext1))
+             subprocess.run(
