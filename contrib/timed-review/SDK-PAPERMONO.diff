@@ -1,0 +1,540 @@
+--- a/libs/hardware/BoardConfig/include/M5Pm1.h
++++ b/libs/hardware/BoardConfig/include/M5Pm1.h
+@@ -45,16 +45,20 @@
+ constexpr uint32_t I2C_HZ = 100000;
+ 
+ // --- registers (official M5PM1 datasheet) ---
+-constexpr uint8_t REG_PWR_CFG = 0x06;     // [3]BOOST_EN [2]LDO_EN [1]DCDC_EN [0]CHG_EN
+-                                          // auto-clears to 0 on reset/download/shutdown
+-constexpr uint8_t REG_WAKE_SRC = 0x05;    // latched wake source; write 0 to clear
+-constexpr uint8_t REG_I2C_CFG = 0x09;     // [4]SPD(0=100k) [3:0]SLP_TO (0=no idle sleep)
+-constexpr uint8_t REG_WDT_CNT = 0x0A;     // seconds; 0 disables the PMIC watchdog
+-constexpr uint8_t REG_SYS_CMD = 0x0C;     // KEY=0xA in high nibble; 1=off, 2=reset, 3=download
+-constexpr uint8_t REG_GPIO_MODE = 0x10;   // 1 = output
+-constexpr uint8_t REG_GPIO_OUT = 0x11;    // output level
+-constexpr uint8_t REG_GPIO_DRV = 0x13;    // 0 = push-pull
++constexpr uint8_t REG_PWR_CFG = 0x06;   // [3]BOOST_EN [2]LDO_EN [1]DCDC_EN [0]CHG_EN
++                                        // auto-clears to 0 on reset/download/shutdown
++constexpr uint8_t REG_WAKE_SRC = 0x05;  // latched wake source; write 0 to clear
++constexpr uint8_t REG_HOLD_CFG = 0x07;
++constexpr uint8_t REG_I2C_CFG = 0x09;    // [4]SPD(0=100k) [3:0]SLP_TO (0=no idle sleep)
++constexpr uint8_t REG_WDT_CNT = 0x0A;    // seconds; 0 disables the PMIC watchdog
++constexpr uint8_t REG_SYS_CMD = 0x0C;    // KEY=0xA in high nibble; 1=off, 2=reset, 3=download
++constexpr uint8_t REG_GPIO_MODE = 0x10;  // 1 = output
++constexpr uint8_t REG_GPIO_OUT = 0x11;   // output level
++constexpr uint8_t REG_GPIO_DRV = 0x13;   // 0 = push-pull
++constexpr uint8_t REG_GPIO_PULL0 = 0x14;
+ constexpr uint8_t REG_GPIO_FUNC0 = 0x16;  // 0 = plain GPIO (vs alt function)
++constexpr uint8_t REG_GPIO_WAKE_EN = 0x18;
++constexpr uint8_t REG_GPIO_WAKE_CFG = 0x19;
+ constexpr uint8_t REG_PWM0_DUTY_L = 0x30;
+ constexpr uint8_t REG_PWM_FREQ_L = 0x34;
+ constexpr uint8_t REG_BTN_STATUS = 0x48;  // [7] event (read-clear), [0] physical level
+@@ -71,6 +75,8 @@
+ constexpr uint8_t LED_R_EN = 1 << 4;  // Paper Mono: red leg of the discrete RGB LED
+ 
+ constexpr uint8_t WAKE_PWR_BUTTON = 1 << 2;
++constexpr uint8_t WAKE_EXTERNAL = 1 << 5;
++constexpr uint8_t LDO_HOLD = 1 << 5;
+ constexpr uint8_t BTN_EVENT = 1 << 7;
+ constexpr uint8_t BTN_PRESSED = 1 << 0;
+ constexpr uint8_t BTN_DOWNLOAD_LOCK = 1 << 7;
+@@ -79,6 +85,7 @@
+ 
+ // EPD_EN is wired to PMIC GPIO0.
+ constexpr uint8_t GPIO0 = 1 << 0;
++constexpr uint8_t GPIO_WAKE_MASK = 0x1F;
+ 
+ // Init the internal I2C bus and pin the PM1 to 100 kHz with idle-sleep disabled
+ // (SLP_TO=0) so it doesn't drop off the bus between transactions. Idempotent —
+@@ -151,6 +158,12 @@
+   uint8_t value = 0;
+   if (!readReg(reg, &value)) return false;
+   return writeReg(reg, static_cast<uint8_t>((value & ~clearMask) | setMask));
++}
++
++inline bool updateRegChecked(uint8_t reg, uint8_t clearMask, uint8_t setMask) {
++  if (!updateReg(reg, clearMask, setMask)) return false;
++  uint8_t value = 0;
++  return readReg(reg, &value) && (value & (clearMask | setMask)) == setMask;
+ }
+ 
+ inline bool configureAppPowerButton(uint8_t* configuredValue = nullptr) {
+@@ -172,10 +185,11 @@
+ 
+ inline bool clearWakeSource() { return writeReg(REG_WAKE_SRC, 0x00); }
+ 
+-inline bool requestShutdown() {
++inline bool requestShutdown(bool (*shouldAbort)(void*) = nullptr, void* context = nullptr) {
+   // The PMIC library's reference implementation waits before issuing a system
+   // command so any preceding rail writes have reached the PY32 firmware.
+   delay(120);
++  if (shouldAbort && shouldAbort(context)) return false;
+   return writeReg(REG_SYS_CMD, SYS_CMD_SHUTDOWN);
+ }
+ 
+--- a/libs/hardware/BoardConfig/include/PaperMonoBoard.h
++++ b/libs/hardware/BoardConfig/include/PaperMonoBoard.h
+@@ -28,6 +28,17 @@
+ namespace freeink {
+ namespace papermono {
+ 
++struct WakeState {
++  uint8_t source = 0;
++  uint8_t enabledPins = 0;
++  bool valid = false;
++};
++
++inline WakeState& bootWakeState() {
++  static WakeState state;
++  return state;
++}
++
+ // One-time boot bring-up (idempotent, cheap after the first call): PMIC bus up
+ // with watchdog off, wake source cleared, power button taken over (the PMIC's
+ // single-click reset is disabled so clicks reach the firmware; its hardware
+@@ -39,6 +50,8 @@
+   if (booted) return ok;
+   booted = true;
+   m5pm1::beginBus();
++  auto& wake = bootWakeState();
++  wake.valid = m5pm1::readWakeSource(&wake.source) && m5pm1::readReg(m5pm1::REG_GPIO_WAKE_EN, &wake.enabledPins);
+   m5pm1::clearWakeSource();
+   m5pm1::configureAppPowerButton();
+   // The red RGB leg lives in the PM1's PWR_CFG, which the PMIC retains across
+@@ -47,6 +60,31 @@
+   m5pm1::updateReg(m5pm1::REG_PWR_CFG, m5pm1::LED_R_EN, 0);
+   ok = m5ioe1::configureOutputs();
+   return ok;
++}
++
++// RTC /IRQ is PM1 GPIO0, separate from the ESP's GPIO wake sources.
++inline bool setRtcWake(bool enabled) {
++  if (!ensureBooted()) return false;
++  using namespace m5pm1;
++  if (!enabled) {
++    uint8_t owners = 0;
++    const bool read = readReg(REG_GPIO_WAKE_EN, &owners);
++    const bool disabled = updateRegChecked(REG_GPIO_WAKE_EN, GPIO0, 0);
++    const bool released = !read || (owners & GPIO_WAKE_MASK) != GPIO0 || updateRegChecked(REG_HOLD_CFG, LDO_HOLD, 0);
++    return read && disabled && released;
++  }
++  uint8_t owners = 0;
++  if (!readReg(REG_GPIO_WAKE_EN, &owners) || (owners & (GPIO_WAKE_MASK & ~GPIO0))) return false;
++  const bool configured = updateRegChecked(REG_GPIO_FUNC0, 0x03, 0) && updateRegChecked(REG_GPIO_MODE, GPIO0, 0) &&
++                          updateRegChecked(REG_GPIO_PULL0, 0x03, 0x01) && updateRegChecked(REG_GPIO_DRV, 0, GPIO0) &&
++                          updateRegChecked(REG_GPIO_WAKE_CFG, GPIO0, 0) && updateRegChecked(REG_PWR_CFG, 0, LDO_EN) &&
++                          updateRegChecked(REG_HOLD_CFG, 0, LDO_HOLD) && updateRegChecked(REG_GPIO_WAKE_EN, 0, GPIO0) &&
++                          clearWakeSource();
++  if (!configured) {
++    updateRegChecked(REG_GPIO_WAKE_EN, GPIO0, 0);
++    updateRegChecked(REG_HOLD_CFG, LDO_HOLD, 0);
++  }
++  return configured;
+ }
+ 
+ // EPD rail (IOE1 IO3 -> EPD_3V3_L3B LDO). Power-on settle is EpdBus's own
+--- a/libs/hardware/Rtc/include/Rtc.h
++++ b/libs/hardware/Rtc/include/Rtc.h
+@@ -1,6 +1,6 @@
+ #pragma once
+ 
+-// FreeInk real-time clock (PCF8563).
++// FreeInk real-time clocks selected by BoardConfig.
+ //
+ // Reads/sets wall-clock time on the I2C RTC described by
+ // BoardConfig::ACTIVE.sensors (rtcAddr / sensor bus pins). Dependency-free
+@@ -26,7 +26,7 @@
+     uint8_t weekday = 0;  // 0=Sunday .. 6=Saturday
+   };
+ 
+-  // Brings up the I2C bus and disables the RTC's CLKOUT. Returns false when the
++  // Brings up the I2C bus and probes the selected RTC. Returns false when the
+   // active board has no RTC or the device doesn't ACK.
+   bool begin();
+   bool present() const { return begun_; }
+@@ -37,6 +37,14 @@
+ 
+   // Sets the time. Returns false on I2C error.
+   bool set(const DateTime& dt);
++
++  // RX8130 countdown only. Above 65535 seconds, round up to whole minutes.
++  // Requires a running, initialized clock and no other enabled RTC interrupt.
++  bool armWakeTimer(uint32_t seconds);
++  // Stops the countdown and clears only its event; verifies TE and TIE are off.
++  bool cancelWakeTimer();
++  // Reads the enabled timer event without clearing it; fired is false on error.
++  bool readWakeTimer(bool& fired);
+ 
+   // Shifts the running clock by a signed number of seconds, calendar-correct
+   // across midnight/month/year boundaries (e.g. a time-zone change from
+--- a/libs/hardware/Rtc/src/Rtc.cpp
++++ b/libs/hardware/Rtc/src/Rtc.cpp
+@@ -1,8 +1,7 @@
+ #include "Rtc.h"
+ 
++#include <BoardConfig.h>
+ #include <time.h>
+-
+-#include <BoardConfig.h>
+ 
+ #if FREEINK_CAP_RTC
+ 
+@@ -35,9 +34,19 @@
+ 
+ // RX8130CE register map (Paper Mono / PaperS3).
+ constexpr uint8_t RX8130_REG_TIME = 0x10;
+-constexpr uint8_t RX8130_REG_CONTROL0 = 0x1D;
+-constexpr uint8_t RX8130_POR_FLAG = 0x80;
+-constexpr uint8_t RX8130_STOP = 0x01;
++constexpr uint8_t RX8130_REG_COUNTER = 0x1A;
++constexpr uint8_t RX8130_REG_EXTENSION = 0x1C;
++constexpr uint8_t RX8130_REG_FLAGS = 0x1D;
++constexpr uint8_t RX8130_REG_CONTROL0 = 0x1E;
++constexpr uint8_t RX8130_VLF = 0x02;
++constexpr uint8_t RX8130_STOP = 0x40;
++constexpr uint8_t RX8130_TIMER = 0x10;  // TE, TF and TIE occupy bit 4.
++constexpr uint8_t RX8130_OTHER_IRQS = 0x28;
++constexpr uint8_t RX8130_TEST = 0x80;
++constexpr uint8_t RX8130_TIMER_STOP = 0x04;
++constexpr uint8_t RX8130_BACKUP_ONLY = 0x01;
++constexpr uint8_t RX8130_CLEAR_VLF = 0xBD;
++constexpr uint8_t RX8130_CLEAR_TF = 0xAF;  // W0C: preserve the other flags.
+ 
+ bool g_wireReady[2] = {false, false};
+ TwoWire& sensorWire() {
+@@ -181,8 +190,9 @@
+       return true;
+     }
+     case BoardConfig::RtcType::Rx8130: {
++      uint8_t flags = 0;
++      if (!readRegs(addr, RX8130_REG_FLAGS, &flags, 1) || (flags & RX8130_VLF)) return false;
+       if (!readRegs(addr, RX8130_REG_TIME, raw, sizeof(raw))) return false;
+-      if (raw[0] & RX8130_POR_FLAG) return false;
+       out.second = bcdToDec(raw[0] & 0x7FU);
+       out.minute = bcdToDec(raw[1] & 0x7FU);
+       out.hour = bcdToDec(raw[2] & 0x3FU);
+@@ -229,7 +239,8 @@
+     wire.write(decToBcd(static_cast<uint8_t>(dt.year % 100)));
+     const bool written = wire.endTransmission() == 0;
+     const bool restarted = writeReg(addr, RX8130_REG_CONTROL0, static_cast<uint8_t>(control & ~RX8130_STOP));
+-    return written && restarted;
++    return written && restarted &&
++           writeReg(addr, RX8130_REG_FLAGS, RX8130_CLEAR_VLF);  // W0C: clear VLF after setting time.
+   }
+   if (s.rtcType == BoardConfig::RtcType::Pcf85063) {
+     wire.beginTransmission(addr);
+@@ -265,6 +276,73 @@
+       writeReg(addr, DS3231_REG_STATUS, static_cast<uint8_t>(status & ~DS3231_STATUS_OSF));
+     }
+   }
++  return true;
++}
++
++bool Rtc::cancelWakeTimer() {
++  if (!begun_ || BoardConfig::ACTIVE.sensors.rtcType != BoardConfig::RtcType::Rx8130) return false;
++  const uint8_t addr = BoardConfig::ACTIVE.sensors.rtcAddr;
++  uint8_t extension = 0, control = 0;
++  bool stopped = readRegs(addr, RX8130_REG_EXTENSION, &extension, 1);
++  if (stopped) stopped = writeReg(addr, RX8130_REG_EXTENSION, extension & ~RX8130_TIMER);
++  bool disabled = readRegs(addr, RX8130_REG_CONTROL0, &control, 1);
++  if (disabled) disabled = writeReg(addr, RX8130_REG_CONTROL0, control & ~RX8130_TIMER);
++  const bool cleared = writeReg(addr, RX8130_REG_FLAGS, RX8130_CLEAR_TF);
++  const bool readExtension = readRegs(addr, RX8130_REG_EXTENSION, &extension, 1);
++  const bool readControl = readRegs(addr, RX8130_REG_CONTROL0, &control, 1);
++  return stopped && disabled && cleared && readExtension && readControl && !(extension & RX8130_TIMER) &&
++         !(control & RX8130_TIMER);
++}
++
++bool Rtc::armWakeTimer(const uint32_t seconds) {
++  if (!begun_ || BoardConfig::ACTIVE.sensors.rtcType != BoardConfig::RtcType::Rx8130 || seconds == 0 ||
++      seconds > 65535UL * 60UL)
++    return false;
++  if (!cancelWakeTimer()) return false;
++  const uint8_t addr = BoardConfig::ACTIVE.sensors.rtcAddr;
++  uint8_t extension = 0, control = 0, flags = 0;
++  if (!readRegs(addr, RX8130_REG_EXTENSION, &extension, 1) || !readRegs(addr, RX8130_REG_CONTROL0, &control, 1) ||
++      !readRegs(addr, RX8130_REG_FLAGS, &flags, 1))
++    return false;
++  // Do not borrow a stopped clock or replace another interrupt owner.
++  if ((control & (RX8130_TEST | RX8130_STOP | RX8130_OTHER_IRQS)) || (flags & RX8130_VLF)) return false;
++  const bool minutes = seconds > 65535UL;
++  const uint16_t count = static_cast<uint16_t>(minutes ? (seconds + 59UL) / 60UL : seconds);
++  extension = static_cast<uint8_t>((extension & ~0x17U) | (minutes ? 0x03U : 0x02U));
++  // Count in both main and backup supply modes; the caller consumes each event.
++  control = static_cast<uint8_t>((control & ~(RX8130_TIMER_STOP | RX8130_BACKUP_ONLY)) | RX8130_TIMER);
++  bool ok = writeReg(addr, RX8130_REG_EXTENSION, extension) && writeReg(addr, RX8130_REG_FLAGS, RX8130_CLEAR_TF) &&
++            writeReg(addr, RX8130_REG_CONTROL0, control);
++  if (ok) {
++    auto& wire = sensorWire();
++    wire.beginTransmission(addr);
++    wire.write(RX8130_REG_COUNTER);
++    wire.write(static_cast<uint8_t>(count));
++    wire.write(static_cast<uint8_t>(count >> 8));
++    ok = wire.endTransmission() == 0;
++    uint8_t readback[2] = {};
++    ok = ok && readRegs(addr, RX8130_REG_COUNTER, readback, sizeof(readback)) &&
++         readback[0] == static_cast<uint8_t>(count) && readback[1] == static_cast<uint8_t>(count >> 8);
++  }
++  if (ok) ok = writeReg(addr, RX8130_REG_EXTENSION, extension | RX8130_TIMER);
++  uint8_t finalExtension = 0, finalControl = 0;
++  ok = ok && readRegs(addr, RX8130_REG_EXTENSION, &finalExtension, 1) &&
++       readRegs(addr, RX8130_REG_CONTROL0, &finalControl, 1) &&
++       finalExtension == static_cast<uint8_t>(extension | RX8130_TIMER) && finalControl == control;
++  if (!ok) cancelWakeTimer();  // Caller must also disarm the external wake route on failure.
++  return ok;
++}
++
++bool Rtc::readWakeTimer(bool& fired) {
++  fired = false;
++  if (!begun_ || BoardConfig::ACTIVE.sensors.rtcType != BoardConfig::RtcType::Rx8130) return false;
++  const uint8_t addr = BoardConfig::ACTIVE.sensors.rtcAddr;
++  uint8_t flags = 0, extension = 0, control = 0;
++  if (!readRegs(addr, RX8130_REG_FLAGS, &flags, 1) || !readRegs(addr, RX8130_REG_EXTENSION, &extension, 1) ||
++      !readRegs(addr, RX8130_REG_CONTROL0, &control, 1))
++    return false;
++  fired = (flags & (RX8130_TIMER | RX8130_VLF)) == RX8130_TIMER && (extension & RX8130_TIMER) &&
++          (control & (RX8130_TEST | RX8130_STOP | RX8130_OTHER_IRQS | RX8130_TIMER)) == RX8130_TIMER;
+   return true;
+ }
+ 
+@@ -299,6 +377,12 @@
+ bool Rtc::begin() { return false; }
+ bool Rtc::now(DateTime&) { return false; }
+ bool Rtc::set(const DateTime&) { return false; }
++bool Rtc::armWakeTimer(uint32_t) { return false; }
++bool Rtc::cancelWakeTimer() { return false; }
++bool Rtc::readWakeTimer(bool& fired) {
++  fired = false;
++  return false;
++}
+ bool Rtc::adjust(int32_t, DateTime*) { return false; }
+ }  // namespace freeink
+ 
+--- /dev/null
++++ b/libs/hardware/Rtc/test/host/RecordingRtcBus.h
+@@ -0,0 +1,54 @@
++#pragma once
++#include <Arduino.h>
++#include <BoardConfig.h>
++#include <PaperMonoBoard.h>
++#include <Rtc.h>
++
++#include <array>
++#include <cassert>
++#include <cstdio>
++#include <vector>
++
++namespace {
++std::array<std::array<uint8_t, 256>, 128> regs{};
++struct Write {
++  uint8_t addr, reg, value;
++};
++std::vector<Write> writes;
++int operations = 0, failAt = 0;
++bool deadBus = false, dropCounter = false, dropEnable = false;
++bool fail() { return deadBus || ++operations == failAt; }
++void reset() {
++  regs = {};
++  writes.clear();
++  operations = failAt = 0;
++  deadBus = dropCounter = dropEnable = false;
++  BoardConfig::ACTIVE.sensors.rtcType = BoardConfig::RtcType::Rx8130;
++}
++}  // namespace
++
++bool hostI2cWrite(uint8_t addr, const std::vector<uint8_t>& bytes) {
++  if (fail()) return false;
++  if (bytes.empty()) return true;
++  for (size_t i = 1; i < bytes.size(); ++i) {
++    const uint8_t reg = bytes[0] + i - 1, value = bytes[i];
++    writes.push_back({addr, reg, value});
++    if (addr == 0x32 && dropCounter && reg == 0x1A) continue;
++    if (addr == 0x32 && dropEnable && reg == 0x1C && (value & 0x10)) continue;
++    if (addr == 0x32 && reg == 0x1D) {
++      assert(!(value & 0x40));
++      regs[addr][reg] &= value | 0x01;  // W0C; VBFF is read-only.
++    } else if (addr == 0x6E && reg == 0x05) {
++      regs[addr][reg] &= value;
++    } else {
++      regs[addr][reg] = value;
++    }
++  }
++  return true;
++}
++bool hostI2cRead(uint8_t addr, uint8_t reg, uint8_t* out, size_t length) {
++  if (fail()) return false;
++  for (size_t i = 0; i < length; ++i) out[i] = regs[addr][reg + i];
++  if (addr == 0x6E && reg == 0x48) regs[addr][reg] &= ~0x80;
++  return true;
++}
+--- /dev/null
++++ b/libs/hardware/Rtc/test/host/RtcTimerTest.cpp
+@@ -0,0 +1,121 @@
++#include "RecordingRtcBus.h"
++
++int main() {
++#if !FREEINK_CAP_RTC
++  Rtc rtc;
++  bool fired = true;
++  assert(!rtc.begin() && !rtc.armWakeTimer(60) && !rtc.cancelWakeTimer());
++  assert(!rtc.readWakeTimer(fired) && !fired);
++  puts("RTC-disabled fallback PASS");
++  return 0;
++#else
++  reset();
++  // Snapshot precedes the destructive PMIC clear and survives later users.
++  regs[0x6E][0x05] = 0x20;
++  regs[0x6E][0x18] = 0x01;
++  assert(freeink::papermono::ensureBooted());
++  const auto snapshot = freeink::papermono::bootWakeState();
++  assert(snapshot.valid && snapshot.source == 0x20 && snapshot.enabledPins == 1);
++  assert(regs[0x6E][0x05] == 0);
++  assert(freeink::papermono::ensureBooted());
++  assert(freeink::papermono::bootWakeState().source == 0x20);
++
++  reset();
++  Rtc rtc;
++  assert(rtc.begin());
++  Rtc::DateTime time;
++  regs[0x32][0x1D] = 0x02;
++  assert(!rtc.now(time));
++  regs[0x32][0x1D] = 0xBF;
++  regs[0x32][0x1E] = 0x10;
++  const Rtc::DateTime expected{2026, 10, 11, 12, 34, 56, 0};
++  assert(rtc.set(expected));
++  assert(regs[0x32][0x1E] == 0x10 && regs[0x32][0x1D] == 0xBD);
++  bool stopped = false;
++  for (const auto& w : writes)
++    if (w.addr == 0x32 && w.reg == 0x1E && w.value == 0x50) stopped = true;
++  assert(stopped && rtc.now(time));
++  assert(time.year == 2026 && time.month == 10 && time.day == 11 && time.second == 56);
++
++  for (const uint32_t seconds : {60U, 65535U, 65536U, 86400U}) {
++    reset();
++    regs[0x32][0x1D] = 0xAC;
++    assert(rtc.armWakeTimer(seconds));
++    const uint16_t count = regs[0x32][0x1A] | (uint16_t(regs[0x32][0x1B]) << 8);
++    assert(count == (seconds > 65535 ? (seconds + 59) / 60 : seconds));
++    assert((regs[0x32][0x1C] & 0x17) == (seconds > 65535 ? 0x13 : 0x12));
++    assert(regs[0x32][0x1D] == 0xAC && (regs[0x32][0x1E] & 0x15) == 0x10);
++    bool fired = true;
++    assert(rtc.readWakeTimer(fired) && !fired);
++    regs[0x32][0x1D] |= 0x10;
++    assert(rtc.readWakeTimer(fired) && fired);
++    assert(rtc.cancelWakeTimer());
++    assert(!(regs[0x32][0x1C] & 0x10) && !(regs[0x32][0x1E] & 0x10));
++    assert(regs[0x32][0x1D] == 0xAC);
++  }
++  reset();
++  assert(!rtc.armWakeTimer(0) && !rtc.armWakeTimer(UINT32_MAX));
++  for (uint8_t conflict : {0x80, 0x40, 0x20, 0x08}) {
++    reset();
++    regs[0x32][0x1E] = conflict;
++    assert(!rtc.armWakeTimer(60));
++    assert(regs[0x32][0x1E] == conflict);
++  }
++  reset();
++  regs[0x32][0x1D] = 0x02;
++  assert(!rtc.armWakeTimer(60));  // Unknown clock is not silently initialized.
++  reset();
++  dropCounter = true;
++  assert(!rtc.armWakeTimer(60) && !(regs[0x32][0x1C] & 0x10));
++  reset();
++  dropEnable = true;
++  assert(!rtc.armWakeTimer(60) && !(regs[0x32][0x1E] & 0x10));
++
++  reset();
++  assert(rtc.armWakeTimer(60));
++  const int armOperations = operations;
++  for (int failure = 1; failure <= armOperations; ++failure) {
++    reset();
++    failAt = failure;
++    assert(!rtc.armWakeTimer(60));
++    failAt = 0;
++    assert(rtc.cancelWakeTimer());
++    assert(!(regs[0x32][0x1C] & 0x10) && !(regs[0x32][0x1E] & 0x10));
++  }
++  reset();
++  deadBus = true;
++  assert(!rtc.cancelWakeTimer());
++  bool fired = true;
++  assert(!rtc.readWakeTimer(fired) && !fired);
++  reset();
++  BoardConfig::ACTIVE.sensors.rtcType = BoardConfig::RtcType::Pcf8563;
++  assert(!rtc.armWakeTimer(60) && !rtc.cancelWakeTimer());
++
++  reset();
++  assert(freeink::papermono::setRtcWake(true));
++  assert(regs[0x6E][0x18] == 1 && !(regs[0x6E][0x19] & 1));
++  assert((regs[0x6E][0x07] & 0x20) && (regs[0x6E][0x06] & 4));
++  assert(freeink::papermono::setRtcWake(false));
++  assert(!(regs[0x6E][0x18] & 1) && !(regs[0x6E][0x07] & 0x20));
++  reset();
++  regs[0x6E][0x18] = 0x10;
++  assert(!freeink::papermono::setRtcWake(true) && regs[0x6E][0x18] == 0x10);
++  reset();
++  assert(freeink::papermono::setRtcWake(true));
++  const int pmicOperations = operations;
++  for (int failure = 1; failure <= pmicOperations; ++failure) {
++    reset();
++    failAt = failure;
++    assert(!freeink::papermono::setRtcWake(true));
++    failAt = 0;
++    assert(freeink::papermono::setRtcWake(false));
++    assert(!(regs[0x6E][0x18] & 1));
++  }
++  reset();
++  hostMillis = 0;
++  const auto abort = [](void*) { return millis() >= 120; };
++  assert(!freeink::m5pm1::requestShutdown(abort));
++  for (const auto& w : writes) assert(!(w.addr == 0x6E && w.reg == freeink::m5pm1::REG_SYS_CMD));
++  printf("RTC and PMIC tests PASS: %d RTC fault points, %d PMIC fault points\n", armOperations, pmicOperations);
++#endif
++}
+--- /dev/null
++++ b/libs/hardware/Rtc/test/host/run.py
+@@ -0,0 +1,20 @@
++#!/usr/bin/env python3
++"""Exercise actual RTC and PMIC helpers with the existing recording Wire stub."""
++from pathlib import Path
++import os
++import subprocess
++import tempfile
++here = Path(__file__).resolve().parent
++rtc = here.parents[1]
++hardware = rtc.parent
++shared = hardware / "BatteryMonitor/test/host/stubs"
++with tempfile.TemporaryDirectory(prefix="rtc-timer-") as temporary:
++    for enabled in (1, 0):
++        exe = Path(temporary) / str(enabled)
++        args = [os.environ.get("CXX", "c++"), "-std=c++20", "-O0", "-Wall", "-Wextra",
++                "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
++                "-DFREEINK_DEVICE_PAPERMONO=1", f"-DFREEINK_CAP_RTC={enabled}"]
++        for include in (here/"stubs", shared, rtc/"include", hardware/"BoardConfig/include"):
++            args += ["-I", str(include)]
++        subprocess.run([*args, str(rtc/"src/Rtc.cpp"), str(here/"RtcTimerTest.cpp"), "-o", str(exe)], check=True)
++        subprocess.run([str(exe)], check=True)
+--- /dev/null
++++ b/libs/hardware/Rtc/test/host/stubs/BoardConfig.h
+@@ -0,0 +1,15 @@
++#pragma once
++#include <cstdint>
++namespace BoardConfig {
++enum class RtcType { None, Pcf8563, Pcf85063, Ds3231, Rx8130 };
++struct Sensors {
++  int i2cSda = 47, i2cScl = 48;
++  uint32_t i2cHz = 100000;
++  uint8_t rtcAddr = 0x32, i2cBus = 0;
++  RtcType rtcType = RtcType::Rx8130;
++};
++struct Profile {
++  Sensors sensors;
++};
++inline Profile ACTIVE;
++}  // namespace BoardConfig
+--- /dev/null
++++ b/libs/hardware/Rtc/test/host/stubs/soc/soc_caps.h
+@@ -0,0 +1,2 @@
++#pragma once
++#define SOC_I2C_NUM 1
