@@ -1,43 +1,40 @@
-# Verified plugin HTTP and a timed SD consumer — review material
+# Verified plugin HTTP and a timed SD consumer
 
-This is source material for two separate proposed CP changes, not a firmware
-release or a request to add the full consumer to the timer primitive PR.
+Updated 11 October 2026. This is source material for two proposed CrossPoint
+changes, provided separately from the timer primitive in PR #3820.
 
-- W06.diff: 37 owned CP paths after the checked-BMP and event-budget changes
-  in PR #3907 and PR #3908. It adds verified requests/downloads/auth using the
-  separately proposed SDK capability contract.
-- TIMED.diff: 38 owned CP paths after W06, PR #3820's timer and PR #3916's bundle
-  installation behavior. The original timer remains Michael Kazakov's
-  (@kivarun) work; SDK verification retains Sameh Foulad's (@sfoulad) credit.
-- source-review.zip: the complete reproducible series, pinned public refs,
-  tests, English facts, validation notes and CP/SDK licenses/notices.
-  Extract it and use its README/reproduce.py. No private base is required.
-- DEVICE-NOTES.en.md: limited automated X4 Pro bench observations, separated
-  by image hash and not presented as hardware acceptance of this new build.
+- [W06.diff](W06.diff): verified requests, downloads and token refresh,
+  after the checked-BMP and event-budget prerequisites (#3907 and #3908).
+- [TIMED.diff](TIMED.diff): the SD-configured timer consumer, after verified
+  HTTP, the existing timer primitive and the bundle-installation fix.
+- [source-review.zip](source-review.zip): the complete series, pinned public
+  refs, tests, reproduction script, validation notes and licenses.
+- [DEVICE-NOTES.en.md](DEVICE-NOTES.en.md): older, limited X4 Pro observations
+  on separate images. They do not qualify this candidate.
 
-The qualified CP base is 3a03be8902479c4240f083aec4e7f61562a4beb2; its SDK pin
-remains 425d200a8ea447326b4b9696e4e47dc84ad9d7f6. Both own diffs need their
-prerequisites and do not apply to raw develop alone. The full composed source
-reconstructed from public refs and built once for X4 Pro in 75.807 seconds,
-with two compile jobs and no retry. The compiled SDK capability is active
-only with the explicit proposal included in the series.
+The tested base is CP `26ccbe2816dd8a9b2b4f5c89ffaac6f1afbdaedd` with SDK pin
+`32a265fa86498c014e13a5bc16133bb021cb620c`. The SDK verification/capability patch
+is still an explicit proposal above that pin. Both CP diffs need their
+prerequisites and do not apply independently to raw develop.
 
-## Status addendum — 9 October 2026
+This update preserves current upstream Metalio wake and power-off behavior,
+adds eight host wake-hold cases and fixes a stale timeout expectation in the
+existing test. It does not enable the full consumer on Metalio or PaperMono.
+Verified HTTP and the SDK proposal are unchanged.
 
-The author has now acknowledged the architecture and maintenance ownership.
-This supersedes the pending ownership wording in the earlier source ZIP.
-The SDK API/ref is still proposed. CP's periodic networking/HAL scope decision,
-prerequisite integration, human-written PR description, required hardware
-acceptance, energy, C3 heap and other models remain separate open gates.
+The source reconstructs from public commits. Six host groups, 16 CTest cases,
+12 verified TLS cases and four TIMED/TLS/BMP loopback cases passed. The composed
+series builds for X4 Pro. The ZIP's validation notes document the existing
+wolfSSL warning, exact build hash and untested hardware behavior.
 
-The caller is limited in source to X4 Pro and Sticky; the bench evidence is
-X4 Pro only. PaperMono is excluded. The consumer is opt-in, uses one SD-owned
-handler and preserves the normal
-reader path. SCOPE.md's active-connectivity restriction and ROADMAP.md's SD
-plugin direction still need a maintainer decision for this periodic route.
-Existing sleep.enter and the timer author's acknowledgment do not settle it.
+The consumer remains opt-in and source-enabled for X4 Pro and Sticky only.
+SDK API acceptance, CP's periodic-networking scope, prerequisite integration
+and new-candidate hardware acceptance remain open. The timer primitive can
+be reviewed and merged independently; this material does not ask to fold
+the full consumer into that PR.
 
-These files contain no account system, service implementation, renderer,
-image templates, firmware binary, private bench harness or raw device logs.
-CP-derived diffs retain LICENSE-CP; the ZIP retains SDK notices and licenses.
-AI tools assisted implementation, tests, review, packaging and these notes.
+Michael Kazakov (@kivarun) authored the timer; Sameh Foulad (@sfoulad) supplied
+the SDK verification work. CP-derived diffs retain LICENSE-CP, and the ZIP
+retains SDK licenses and notices. AI tools assisted code, tests, review and
+these notes. No firmware binary, account system or service implementation
+is included.

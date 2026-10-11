@@ -85,7 +85,7 @@
 +and the complete supported-model matrix require separate hardware acceptance.
 --- a/lib/I18n/translations/english.yaml
 +++ b/lib/I18n/translations/english.yaml
-@@ -299,6 +299,7 @@
+@@ -308,6 +308,7 @@
  STR_EVENT_READING_SESSION: "reading sessions"
  STR_EVENT_DOWNLOAD: "downloads"
  STR_EVENT_SLEEP: "sleep and current book"
@@ -243,8 +243,8 @@
  #if FREEINK_DEVICE_EEGO_A4
    // LM3630A and GSL share I2C; turn the light off before touch releases the bus.
    Frontlight.setOn(false);
-@@ -170,9 +156,9 @@
-   }
+@@ -166,9 +152,9 @@
+   freeink::metalio::powerOff();
  #endif
  
 -  // Waits for the power button to be physically released (so holding it doesn't
@@ -516,7 +516,7 @@
  
    // Read-and-clear so a panic later in setup() doesn't loop into silent reboot.
    // Bound the target range too — RTC_NOINIT memory is uninitialized on cold boot.
-@@ -461,19 +566,53 @@
+@@ -461,21 +566,54 @@
    gpio.begin();
    powerManager.begin();
  
@@ -557,11 +557,13 @@
    // boot — but defer the sleep-or-boot decision until SETTINGS is loaded below:
    // click-to-wake is a setting, and an X4 battery power-off cuts all power, so
    // only SD state survives to the next boot.
--  const bool wakeHoldVerified = wakeupReason != HalGPIO::WakeupReason::PowerButton || gpio.verifyPowerButtonWakeup();
 +  const bool manualTimerWake =
 +      resumedTimerPower || (wakeupReason == HalGPIO::WakeupReason::Timer && timerHooks.manualPower);
 +  const bool powerWake = wakeupReason == HalGPIO::WakeupReason::PowerButton || manualTimerWake;
-+  const bool wakeHoldVerified = !powerWake || gpio.verifyPowerButtonWakeup();
+   // The Metalio boots after the button is released, so it skips the check.
+-  const bool wakeHoldVerified = wakeupReason != HalGPIO::WakeupReason::PowerButton || BoardConfig::isMetalioEInk4() ||
+-                                gpio.verifyPowerButtonWakeup();
++  const bool wakeHoldVerified = !powerWake || BoardConfig::isMetalioEInk4() || gpio.verifyPowerButtonWakeup();
  
    // X4 Pro and X4 Classic both map BTN_UP to GPIO0 — an ESP32-S3 boot strap — so
    // gate recovery on the non-strap Down key (GPIO7) to avoid a stuck-in-recovery loop.
@@ -574,7 +576,7 @@
  
    halTiltSensor.begin();
    halClock.begin();
-@@ -486,7 +625,7 @@
+@@ -488,7 +626,7 @@
  
    // SD Card Initialization
    // We need 6 open files concurrently when parsing a new chapter
@@ -583,7 +585,7 @@
      LOG_ERR("MAIN", "SD card initialization failed");
      setupDisplayAndFonts(isSilentReboot);
      activityManager.goToFullScreenMessage("SD card error", EpdFontFamily::BOLD);
-@@ -496,7 +635,7 @@
+@@ -498,7 +636,7 @@
    HalSystem::checkPanic();
  
    APP_STATE.loadFromFile();
@@ -592,7 +594,7 @@
    const bool isPersistedSleepWake = isSleepWake && !APP_STATE.showBootScreen;
  
    if (recoveryFirmwareMode) {
-@@ -536,19 +675,18 @@
+@@ -538,19 +676,18 @@
  
    switch (wakeupReason) {
      case HalGPIO::WakeupReason::PowerButton:
@@ -1049,7 +1051,7 @@
 +}  // namespace timedwake
 --- a/test/CMakeLists.txt
 +++ b/test/CMakeLists.txt
-@@ -88,3 +88,5 @@
+@@ -91,3 +91,5 @@
  add_test(NAME TrustedTimeFresh COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/trusted_time_fresh/run.py)
  
  add_test(NAME TimerWakeArm COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/timer_wake_arm/run.py)
@@ -1079,7 +1081,7 @@
              except (OSError, ssl.SSLError):
 --- /dev/null
 +++ b/test/timed_sync/BootIoTest.cpp
-@@ -0,0 +1,390 @@
+@@ -0,0 +1,429 @@
 +// Executes the exact production syncTimerPanel body extracted by run.py.
 +// Network/join/display lifecycle boundaries are stubs; no full Arduino boot.
 +#include <cassert>
@@ -1107,6 +1109,12 @@
 +void delay(uint32_t n) { nowMs += n; }
 +struct GPIO {
 +  bool captured = false, captureActive = false;
++  bool wakeHeld = false;
++  int wakeHoldChecks = 0;
++  bool verifyPowerButtonWakeup() {
++    ++wakeHoldChecks;
++    return wakeHeld;
++  }
 +  bool rawPowerButtonPressed() { return nowMs >= pressAt; }
 +  bool beginPowerPressCapture() {
 +    captured = false;
@@ -1200,6 +1208,8 @@
 +}  // namespace trustedtime
 +namespace BoardConfig {
 +bool supported = true;
++bool metalio = false;
++bool isMetalioEInk4() { return metalio; }
 +bool isSticky() { return supported; }
 +bool isX4Pro() { return false; }
 +struct Profile {
@@ -1276,6 +1286,36 @@
 +static uint64_t prepareTimerPanel();
 +#include "TimerBootHooksSource.inc"
 +#include "TimerPanelSource.inc"
++namespace HalGPIO {
++using WakeupReason = wakeup::Reason;
++}
++static bool verifyWakeHold(wakeup::Reason wakeupReason, bool resumedTimerPower) {
++#include "WakeHoldSource.inc"
++  return wakeHoldVerified;
++}
++
++static void testWakeHold() {
++  using R = wakeup::Reason;
++  struct Case {
++    R reason;
++    bool resumed, takeover, metalio, held, accepted;
++    int checks;
++  };
++  const Case cases[] = {
++      {R::PowerButton, false, false, true, false, true, 0}, {R::PowerButton, false, false, false, false, false, 1},
++      {R::PowerButton, false, false, false, true, true, 1}, {R::Timer, false, true, false, false, false, 1},
++      {R::Timer, false, true, false, true, true, 1},        {R::Timer, false, false, false, false, true, 0},
++      {R::Other, true, false, false, false, false, 1},      {R::Other, false, false, false, false, true, 0},
++  };
++  for (const auto& c : cases) {
++    BoardConfig::metalio = c.metalio;
++    gpio.wakeHeld = c.held;
++    gpio.wakeHoldChecks = 0;
++    timerHooks.manualPower = c.takeover;
++    assert(verifyWakeHold(c.reason, c.resumed) == c.accepted);
++    assert(gpio.wakeHoldChecks == c.checks);
++  }
++}
 +static bool runSync() {
 +  gpio.beginPowerPressCapture();
 +  if (timerHooks.powerPressed()) return true;
@@ -1314,6 +1354,7 @@
 +  pluginevents::state = pluginevents::TimedState::Staged;
 +}
 +int main() {
++  testWakeHold();
 +  reset();
 +  Storage.ok = false;
 +  assert(!runSync());
@@ -1381,7 +1422,7 @@
 +  reset();
 +  trustedtime::clockReady = false;
 +  assert(!runSync());
-+  assert(nowMs == 5000 && initCalls == 0 && paintCalls == 0 && WiFi.modeValue == WIFI_OFF);
++  assert(nowMs == 10000 && initCalls == 0 && paintCalls == 0 && WiFi.modeValue == WIFI_OFF);
 +  for (const auto& event : trace) assert(event != "FETCH");
 +  reset();
 +  trustedtime::clockReady = false;
@@ -2132,7 +2173,7 @@
 +print('TIMED -> real SDK TLS -> BMP decode/commit/panel-call: 4 cases PASS')
 --- /dev/null
 +++ b/test/timed_sync/run.py
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,89 @@
 +"""Production timer selection, verified fetch/commit and silent paint at host boundaries."""
 +from pathlib import Path
 +import os
@@ -2164,6 +2205,9 @@
 +    start=main.index('  struct TimerBootHooks {')
 +    end=main.index('} timerHooks;',start)+len('} timerHooks;')
 +    (Path(tmp)/'TimerBootHooksSource.inc').write_text(main[start:end])
++    start=main.index('  const bool manualTimerWake =')
++    end=main.index(';',main.index('  const bool wakeHoldVerified =',start))+1
++    (Path(tmp)/'WakeHoldSource.inc').write_text(main[start:end])
 +    exe=Path(tmp)/'boot-io'
 +    subprocess.run(['c++','-std=c++20','-O0',*sanitize,'-I',tmp,'-I',str(root/'src'),'-I',str(root/'lib/hal'),str(here/'BootIoTest.cpp'),'-o',str(exe)],check=True)
 +    subprocess.run([str(exe)],check=True)
@@ -2195,7 +2239,6 @@
 +assert 'wakeupReason == HalGPIO::WakeupReason::Timer && timerHooks.manualPower' in main
 +assert 'timedwake::consumeManualWake(resetReason, timerManualWakeStamp)' in main
 +assert 'const bool powerWake = wakeupReason == HalGPIO::WakeupReason::PowerButton || manualTimerWake' in main
-+assert 'const bool wakeHoldVerified = !powerWake || gpio.verifyPowerButtonWakeup()' in main
 +assert 'const bool recoveryFirmwareMode =' in main and 'powerWake && !BoardConfig::isPaperMono()' in main
 +assert 'timedwake::acceptManualWake(wakeHoldVerified,' in main
 +assert 'if (manualTimerWake) returnToTimerStandby();' in main
