@@ -1,0 +1,15 @@
+{
+  "cp": {
+    "url": "https://github.com/crosspoint-reader/crosspoint-reader.git",
+    "commit": "44626dd5bcc289b0c6b4a0615232e74e1a1d2a8e",
+    "author": "jadehawk",
+    "pr": 3877
+  },
+  "sdkPin": "425d200a8ea447326b4b9696e4e47dc84ad9d7f6",
+  "googletest": {
+    "url": "https://github.com/google/googletest.git",
+    "commit": "52eb8108c5bdec04579160ae17225d66034bd723"
+  },
+  "patchSha256": "62ae876800351266d56e999b9a215817f58f7cea71c1737b5e4dfa451064442b",
+  "resultSha256": "7289bc3b64e195ed7e48fb0fe705a7cb024945dddf42755d088453d69236f432"
+}
