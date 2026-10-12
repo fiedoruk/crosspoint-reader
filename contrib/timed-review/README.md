@@ -12,8 +12,11 @@ Updated 12 October 2026. The complete consumer is available in the
   run `python3 replay.py /absolute/path/to/new-empty-receiver` from the extracted
   directory. [Requirements and commands](current/README.md#reproduce).
 - [Validation and remaining limits](current/VALIDATION.md) distinguish host,
-  build and device evidence. The packaged sources match the recorded Sticky
-  build; this update adds no firmware build or new device qualification.
+  build and device evidence from the source-packaging snapshot.
+- [Sticky device results — 12 October](device/STICKY-2026-10-12.md) qualify the
+  exact neutral binary on one unit: USB and battery refresh, failure retention,
+  certificate rejection and return to the same book position. The source series
+  and its packaged files are unchanged; other device and release gates remain.
 
 This remains dependent source-review material, not a merge-ready patch against
 raw develop. SDK verification and dependency integration need accepted refs.
