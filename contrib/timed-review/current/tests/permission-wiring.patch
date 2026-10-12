@@ -1,0 +1,33 @@
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -339,7 +339,7 @@
+ }
+ 
+ // Enter deep sleep mode
+-static uint64_t prepareTimerPanel();
++static uint64_t prepareTimerPanel(bool restorePluginPermission = false);
+ 
+ void enterDeepSleep(bool fromTimeout = false) {
+   HalPowerManager::Lock powerLock;  // Ensure we are at normal CPU frequency for sleep preparation
+@@ -452,10 +452,11 @@
+ 
+ // Read cadence and credentials before the first ordinary sleep and on every
+ // autonomous wake. Snapshot one handler/grant/config, never a reader outbox.
+-static uint64_t prepareTimerPanel() {
++static uint64_t prepareTimerPanel(const bool restorePluginPermission) {
+   pluginevents::discardTimed();
+   if (!timerStorageReady) timerStorageReady = Storage.ready() || Storage.begin();
+   if (!timerStorageReady) return 0;
++  if (restorePluginPermission && !SETTINGS.loadPluginPermissionForTimer()) return 0;
+   pluginevents::refreshSubscriptions();
+   const uint64_t interval =
+       pluginevents::prepareTimed(BoardConfig::ACTIVE.displayHeight, BoardConfig::ACTIVE.displayWidth);
+@@ -579,7 +580,7 @@
+       return manualPower;
+     }
+     uint16_t batteryPercent() const { return powerManager.getBatteryPercentage(); }
+-    uint64_t prepare() { return prepareTimerPanel(); }
++    uint64_t prepare() { return prepareTimerPanel(true); }
+     void sync() { manualPower = syncTimerPanel(); }
+     void sleep(const uint64_t intervalUs) const {
+       pluginevents::discardTimed();

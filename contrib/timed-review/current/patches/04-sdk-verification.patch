@@ -1,0 +1,77 @@
+diff --git a/libs/network/SecureNet/include/SecureClient.h b/libs/network/SecureNet/include/SecureClient.h
+index ec9fccc..15e1b51 100644
+--- a/libs/network/SecureNet/include/SecureClient.h
++++ b/libs/network/SecureNet/include/SecureClient.h
+@@ -71,6 +71,10 @@ class SecureClient : public Client {
+   // True if the library was built with wolfSSL TLS 1.3 support enabled.
+   static bool tls13Available();
+ 
++  // True when verified connections enforce CA loading and peer hostname checks.
++  // This reports backend support, not the verification state of a connection.
++  static bool peerVerificationAvailable();
++
+  private:
+   int connectWithMethod(const char* host, uint16_t port, void* method, const char* label);
+ 
+diff --git a/libs/network/SecureNet/include/SecureHttpClient.h b/libs/network/SecureNet/include/SecureHttpClient.h
+index aac21ef..cd7ca60 100644
+--- a/libs/network/SecureNet/include/SecureHttpClient.h
++++ b/libs/network/SecureNet/include/SecureHttpClient.h
+@@ -51,6 +51,7 @@ namespace freeink {
+ 
+ class SecureHttpClient {
+  public:
++  static bool peerVerificationAvailable() { return SecureClient::peerVerificationAvailable(); }
+   using DataCallback = std::function<bool(const uint8_t* data, size_t len)>;
+   using AbortCallback = std::function<bool()>;
+   // (bytes so far, total from Content-Length or 0 when unknown).
+diff --git a/libs/network/SecureNet/src/SecureClient.cpp b/libs/network/SecureNet/src/SecureClient.cpp
+index 1b5aaf6..e0abc7a 100644
+--- a/libs/network/SecureNet/src/SecureClient.cpp
++++ b/libs/network/SecureNet/src/SecureClient.cpp
+@@ -17,6 +17,14 @@ bool SecureClient::tls13Available() {
+ #endif
+ }
+ 
++bool SecureClient::peerVerificationAvailable() {
++#if defined(FREEINK_NET_WOLFSSL)
++  return true;
++#else
++  return false;
++#endif
++}
++
+ SecureClient::~SecureClient() { stop(); }
+ 
+ void SecureClient::setCACert(const char* rootCA) { _rootCA = rootCA; }
+@@ -90,8 +98,13 @@ int SecureClient::connectWithMethod(const char* host, uint16_t port, void* metho
+   if (_insecure) {
+     wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_NONE, nullptr);
+   } else if (_rootCA) {
+-    wolfSSL_CTX_load_verify_buffer(ctx, reinterpret_cast<const unsigned char*>(_rootCA),
+-                                   strlen(_rootCA), WOLFSSL_FILETYPE_PEM);
++    // Refuse an invalid trust store before the handshake.
++    if (wolfSSL_CTX_load_verify_buffer(ctx, reinterpret_cast<const unsigned char*>(_rootCA), strlen(_rootCA),
++                                       WOLFSSL_FILETYPE_PEM) != WOLFSSL_SUCCESS) {
++      if (Serial) Serial.printf("[SecureClient] CA load failed (%s)\n", label);
++      stop();
++      return 0;
++    }
+   }
+   wolfSSL_SetIORecv(ctx, wcRecv);
+   wolfSSL_SetIOSend(ctx, wcSend);
+@@ -106,6 +119,14 @@ int SecureClient::connectWithMethod(const char* host, uint16_t port, void* metho
+   wolfSSL_SetIOReadCtx(ssl, &_transport);
+   wolfSSL_SetIOWriteCtx(ssl, &_transport);
+   wolfSSL_UseSNI(ssl, WOLFSSL_SNI_HOST_NAME, host, strlen(host));
++  if (!_insecure) {
++    // SNI selects the host; certificate matching must be enabled separately.
++    if (wolfSSL_check_domain_name(ssl, host) != WOLFSSL_SUCCESS) {
++      if (Serial) Serial.printf("[SecureClient] domain check setup failed (%s): %s\n", label, host);
++      stop();
++      return 0;
++    }
++  }
+ #if defined(WOLFSSL_TLS13) && defined(HAVE_CURVE25519)
+   // MEMFIX-PORT: pin the TLS 1.3 key_share to X25519. wolfSSL's default is a
+   // P-256 share, generated with fast-math bignums that WOLFSSL_SMALL_STACK
