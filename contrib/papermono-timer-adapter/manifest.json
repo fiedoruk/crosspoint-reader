@@ -1,0 +1,13 @@
+{
+  "base": "c3568c7abaaedb427f35421e73a712ac77fcc996",
+  "oldSdk": "425d200a8ea447326b4b9696e4e47dc84ad9d7f6",
+  "sdk": "1a5448dfa705d6499fbff20371539bf553865dd2",
+  "patchSha256": "0fa79deb5230ed58ac738eed630264eff3a2a2b01f56ff7b045b517c8c78f791",
+  "files": {
+    "LICENSE": "5d025639b5237e35cf93c4ca598ebde40f31f032bf9a9a19fceb3703dca68b84",
+    "papermono-timer-adapter.patch": "0fa79deb5230ed58ac738eed630264eff3a2a2b01f56ff7b045b517c8c78f791",
+    "README.md": "a6883a75ef30e77f9ba28ed22bd994558f032426839750fb8932a78e2077472b",
+    "replay.py": "f3bf229ea5d107fe4248b7d68d269cdbd62c27af2a4fe6d3412de243340df4a1",
+    "comment-template.en.md": "b3069235784bd9db29ca1c272de5f11ae4607d434691e787fc42a414aa277733"
+  }
+}
