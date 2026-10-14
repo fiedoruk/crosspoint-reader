@@ -1,0 +1,271 @@
+diff --git a/docs/sd-plugins.md b/docs/sd-plugins.md
+index cd3facb..26c3838 100644
+--- a/docs/sd-plugins.md
++++ b/docs/sd-plugins.md
+@@ -38,6 +38,12 @@ tokens. If no installed copy exists, the bundle uses its configured destination
+ root as before. Nested bundle subdirectories and non-plugin destinations are
+ unchanged.
+ 
++Selecting a bundle in a catalog targeting a plugin root first opens paged details:
++the title, version when available, and the catalog's description field. Choose
++**Install** or **Update** to start downloading; **Back** cancels. Details are limited
++to 4096 bytes, including formatting, and 64 line breaks in the received fields.
++This does not change folder navigation or downloads to non-plugin destinations.
++
+ During firmware-managed plugin installation, a plugin directory may contain a
+ `.installing` marker. Normal plugin discovery and file resolution quarantine that
+ directory until the transaction completes, even if `manifest.json`, `plugin.js`,
+diff --git a/src/activities/plugins/PluginCatalogActivity.cpp b/src/activities/plugins/PluginCatalogActivity.cpp
+index fec2955..d98e087 100644
+--- a/src/activities/plugins/PluginCatalogActivity.cpp
++++ b/src/activities/plugins/PluginCatalogActivity.cpp
+@@ -742,6 +742,10 @@ bool PluginCatalogActivity::parseBrowseResponse() {
+     }
+   }
+ 
++  std::string bundleRoot = downloadDir();
++  while (!bundleRoot.empty() && bundleRoot.back() == '/') bundleRoot.pop_back();
++  pluginBundleCatalog = manifest.isBundle() && PluginLocations::isPluginRoot(bundleRoot);
++
+   releaseRows();
+   items.clear();
+   items.reserve(manifest.pageSize + 1);
+@@ -1302,6 +1306,45 @@ void PluginCatalogActivity::activateItem(const int itemIndex) {
+     fetchPage(page);
+     return;
+   }
++  if (pluginBundleCatalog && !item.files.empty()) {
++    constexpr size_t MAX_DETAILS_BYTES = 4096;
++    constexpr size_t MAX_DETAILS_BREAKS = 64;
++    const size_t textBytes = item.title.size() + item.author.size() + item.version.size();
++    const auto lineBreaks = [](const std::string& value) {
++      return std::count_if(value.begin(), value.end(), [](char c) { return c == '\n' || c == '\0'; });
++    };
++    // Each explicit break becomes a span while the catalog remains on the stack.
++    if (textBytes > MAX_DETAILS_BYTES - 8 ||
++        lineBreaks(item.title) + lineBreaks(item.author) + lineBreaks(item.version) > MAX_DETAILS_BREAKS) {
++      LOG_ERR("PCAT", "Plugin details exceed the text limit");
++      fail(StrId::STR_MEMORY_ERROR);
++      return;
++    }
++    std::string text;
++    text.reserve(textBytes + 4);
++    text.append(item.title);
++    if (!item.version.empty()) {
++      text.append("\nv");
++      text.append(item.version);
++    }
++    text.append("\n\n");
++    text.append(item.author);
++    const StrId action = item.status == tr(STR_UPDATE_AVAILABLE) ? StrId::STR_UPDATE : StrId::STR_INSTALL;
++    auto details = makeUniqueNoThrow<DictionaryDefinitionActivity>(renderer, mappedInput, tr(STR_PLUGINS),
++                                                                   std::move(text), false, action);
++    if (!details) {
++      fail(StrId::STR_MEMORY_ERROR);
++      return;
++    }
++    const std::string expectedId = item.id;
++    startActivityForResult(std::move(details), [this, itemIndex, expectedId](const ActivityResult& response) {
++      if (response.isCancelled || state != State::BROWSING || itemIndex >= static_cast<int>(items.size()) ||
++          items[itemIndex].id != expectedId)
++        return;
++      downloadItem(itemIndex);
++    });
++    return;
++  }
+   downloadItem(itemIndex);
+ }
+ 
+@@ -1323,10 +1366,12 @@ void PluginCatalogActivity::drawFooter() {
+       if (state != State::BROWSING) {
+         confirmLabel = count > 0 ? tr(STR_OPEN) : "";
+       } else {
+-        // Folders open; items and the pager rows both fetch from the server.
++        // Folders and plugin details open; other items and pager rows fetch.
+         const bool onDir =
+             manifest.isXmlList() && itemSel >= 0 && itemSel < static_cast<int>(items.size()) && items[itemSel].isDir;
+-        confirmLabel = count == 0 ? "" : (onDir ? tr(STR_OPEN) : tr(STR_FETCH));
++        const bool details = itemSel >= 0 && itemSel < static_cast<int>(items.size()) && pluginBundleCatalog &&
++                             !items[itemSel].files.empty();
++        confirmLabel = count == 0 ? "" : ((onDir || details) ? tr(STR_OPEN) : tr(STR_FETCH));
+       }
+       // On the top row of a searchable catalog the previous-nav slot becomes
+       // Search (front Left), mirroring the OPDS browser's side-button search.
+diff --git a/src/activities/plugins/PluginCatalogActivity.h b/src/activities/plugins/PluginCatalogActivity.h
+index 572d150..c2f8761 100644
+--- a/src/activities/plugins/PluginCatalogActivity.h
++++ b/src/activities/plugins/PluginCatalogActivity.h
+@@ -126,6 +126,7 @@ class PluginCatalogActivity final : public CatalogActivity {
+   Manifest manifest;
+   std::vector<PluginRef> installedPlugins;
+   bool pluginHubAvailable = false;
++  bool pluginBundleCatalog = false;
+   bool showPluginHubInstallRow = false;
+   bool ignoreHubInstallerBackRelease = false;
+   OptionPopup pluginHubPopup;
+diff --git a/src/activities/reader/DictionaryDefinitionActivity.cpp b/src/activities/reader/DictionaryDefinitionActivity.cpp
+index f147c9f..01bcf94 100644
+--- a/src/activities/reader/DictionaryDefinitionActivity.cpp
++++ b/src/activities/reader/DictionaryDefinitionActivity.cpp
+@@ -4,12 +4,14 @@
+ #include <GfxRenderer.h>
+ #include <I18n.h>
+ #include <Logging.h>
++#include <Memory.h>
+ 
+ #include <algorithm>
+ #include <cstdint>
+ #include <cstdio>
+ 
+ #include "CrossPointSettings.h"
++#include "HalGPIO.h"
+ #include "HapticFeedback.h"
+ #include "components/UITheme.h"
+ #include "util/DictHtmlPages.h"
+@@ -20,6 +22,7 @@ namespace {
+ // Longest measurable/drawable span. Wrapped lines stay under the screen width
+ // (far below this); only pathological unbreakable tokens are split at this cap.
+ constexpr size_t MAX_LINE_BYTES = 191;
++constexpr freeink::ui::ActionId CONFIRM_ACTION = 1;
+ constexpr float PLAIN_TEXT_LINE_SPACING = 1.5f;
+ 
+ // Styled-path ceiling: the laid-out Pages keep the whole definition resident
+@@ -33,6 +36,31 @@ constexpr size_t MAX_STYLED_HTML_BYTES = 16 * 1024;
+ 
+ void DictionaryDefinitionActivity::onEnter() {
+   Activity::onEnter();
++  if (confirmLabel) {
++    result.isCancelled = true;
++    confirmationUi = makeUniqueNoThrow<UiAppHost>(renderer);
++    if (!confirmationUi) {
++      LOG_ERR("DICT", "Unable to allocate confirmation controls");
++      finish();
++      return;
++    }
++    confirmHeldOnEntry = mappedInput.isPressed(MappedInputManager::Button::Confirm);
++    confirmationUi->resetUi();
++    confirmationUi->app.setScreen(
++        [](UiAppHost::UiScreen& screen, void* context) {
++          auto& activity = *static_cast<DictionaryDefinitionActivity*>(context);
++          if (!gpio.hasTouch()) return;
++          const BodyArea body = activity.bodyArea();
++          const auto& metrics = UITheme::getInstance().getMetrics();
++          freeink::ui::ButtonProps button;
++          button.label = I18N.get(*activity.confirmLabel);
++          button.action = CONFIRM_ACTION;
++          screen.button(button, {static_cast<int16_t>(body.x),
++                                 static_cast<int16_t>(body.y + body.height + metrics.verticalSpacing),
++                                 static_cast<int16_t>(body.width), screen.theme().rowHeight});
++        },
++        this);
++  }
+   // Normalize StarDict multi-type separators so the wrap loop and the
+   // C-string font APIs below both see the whole definition.
+   std::replace(definition.begin(), definition.end(), '\0', '\n');
+@@ -55,6 +83,7 @@ void DictionaryDefinitionActivity::onEnter() {
+ }
+ 
+ void DictionaryDefinitionActivity::onExit() {
++  confirmationUi.reset();
+   Activity::onExit();
+   if (auto* fcm = renderer.getFontCacheManager()) {
+     fcm->releaseSdFontCaches();
+@@ -77,7 +106,10 @@ DictionaryDefinitionActivity::BodyArea DictionaryDefinitionActivity::bodyArea()
+   const int x = contentLeft + metrics.contentSidePadding;
+   const int y = std::max(top, isInverted ? metrics.buttonHintsHeight : 0) + metrics.topPadding + metrics.headerHeight +
+                 metrics.verticalSpacing;
+-  const int bottomArea = std::max(bottom, metrics.buttonHintsHeight) + metrics.verticalSpacing;
++  int bottomArea = std::max(bottom, metrics.buttonHintsHeight) + metrics.verticalSpacing;
++  if (confirmationUi && gpio.hasTouch()) {
++    bottomArea += confirmationUi->app.theme().rowHeight + metrics.verticalSpacing;
++  }
+   return {x, y, renderer.getScreenWidth() - contentLeft - contentRight - 2 * metrics.contentSidePadding,
+           renderer.getScreenHeight() - y - bottomArea};
+ }
+@@ -224,6 +256,26 @@ void DictionaryDefinitionActivity::loop() {
+     return;
+   }
+ 
++  if (confirmationUi) {
++    const auto touch = confirmationUi->routeTouch(mappedInput);
++    if (touch.event.action == CONFIRM_ACTION) {
++      result.isCancelled = false;
++      finish();
++      return;
++    }
++    if (confirmHeldOnEntry) {
++      if (!mappedInput.isPressed(MappedInputManager::Button::Confirm)) confirmHeldOnEntry = false;
++    } else if (confirmationUi->routingReady() && mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
++      result.isCancelled = false;
++      finish();
++      return;
++    }
++    if (touch.routed && confirmationUi->app.invalidated()) {
++      requestUpdate();
++      return;
++    }
++  }
++
+   // Same tap zones as the reader page turns: left third = previous page,
+   // the rest = next. Back is the usual left-edge swipe.
+   int tx = 0;
+@@ -311,8 +363,10 @@ void DictionaryDefinitionActivity::render(RenderLock&&) {
+   scope.endScanAndPrewarm();
+   drawBody(fontId, body.x, body.y);
+ 
+-  const auto labels =
+-      mappedInput.mapLabels(tr(STR_BACK), "", (currentPage > 0 ? "<" : ""), (currentPage + 1 < totalPages ? ">" : ""));
++  if (confirmationUi) confirmationUi->renderUi();
++
++  const auto labels = mappedInput.mapLabels(tr(STR_BACK), confirmLabel ? I18N.get(*confirmLabel) : "",
++                                            (currentPage > 0 ? "<" : ""), (currentPage + 1 < totalPages ? ">" : ""));
+   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+   renderer.displayBuffer();
+ }
+diff --git a/src/activities/reader/DictionaryDefinitionActivity.h b/src/activities/reader/DictionaryDefinitionActivity.h
+index 63ec04d..2abfafb 100644
+--- a/src/activities/reader/DictionaryDefinitionActivity.h
++++ b/src/activities/reader/DictionaryDefinitionActivity.h
+@@ -1,13 +1,16 @@
+ #pragma once
+ 
+ #include <Epub/Page.h>
++#include <I18n.h>
+ 
+ #include <cstdint>
+ #include <memory>
++#include <optional>
+ #include <string>
+ #include <vector>
+ 
+ #include "activities/Activity.h"
++#include "components/UiAppHost.h"
+ #include "util/ButtonNavigator.h"
+ 
+ // Paged viewer for one dictionary definition. HTML definitions are laid out
+@@ -17,11 +20,13 @@
+ class DictionaryDefinitionActivity final : public Activity {
+  public:
+   explicit DictionaryDefinitionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string headword,
+-                                        std::string definition, bool htmlDefinition = false)
++                                        std::string definition, bool htmlDefinition = false,
++                                        std::optional<StrId> confirmLabel = std::nullopt)
+       : Activity("DictionaryDefinition", renderer, mappedInput),
+         headword(std::move(headword)),
+         definition(std::move(definition)),
+-        htmlDefinition(htmlDefinition) {}
++        htmlDefinition(htmlDefinition),
++        confirmLabel(confirmLabel) {}
+ 
+   void onEnter() override;
+   void onExit() override;
+@@ -55,6 +60,9 @@ class DictionaryDefinitionActivity final : public Activity {
+   // separators) to newlines so C-string APIs see the whole text.
+   std::string definition;
+   const bool htmlDefinition;
++  const std::optional<StrId> confirmLabel;
++  std::unique_ptr<UiAppHost> confirmationUi;
++  bool confirmHeldOnEntry = false;
+   // Styled path: reader-identical Pages laid out from the HTML definition.
+   // Empty means the plain-text span path below is active.
+   std::vector<std::unique_ptr<Page>> pages;

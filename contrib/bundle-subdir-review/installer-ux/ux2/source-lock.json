@@ -1,0 +1,40 @@
+{
+  "cp": {
+    "url": "https://github.com/crosspoint-reader/crosspoint-reader.git",
+    "commit": "5e8b503f4ddefe94abe90b3b67ec3812b9a8273f"
+  },
+  "sdk": {
+    "url": "https://github.com/Free-Ink/freeink-sdk.git",
+    "commit": "7fcd3b34c108f28c086ade3b433924022dbc0998"
+  },
+  "gtest": {
+    "url": "https://github.com/google/googletest.git",
+    "commit": "52eb8108c5bdec04579160ae17225d66034bd723"
+  },
+  "patchOrder": [
+    "ux1.patch",
+    "ux2.patch"
+  ],
+  "resultFiles": {
+    "docs/sd-plugins.md": "958e2a374874ae4bd049273ea661f574d4dda50b9f71b2cb5f46e108c58dcf2c",
+    "src/activities/plugins/PluginCatalogActivity.cpp": "a865eb9fc6a759042d018bfa29574704679ca550916bde0e883d16d0a7fb5573",
+    "src/activities/plugins/PluginCatalogActivity.h": "fbdf4ac92e9e53cf67eca3f3fe9fc92b893cceb1ecf5442a2d392b70e48de479",
+    "src/activities/reader/DictionaryDefinitionActivity.cpp": "1732ec5493f9cf5415cfc328af799afbe59239ea33b1aa0a55e90a84363975f1",
+    "src/activities/reader/DictionaryDefinitionActivity.h": "665a41c3f1204fc837e7cec16351d19e935e2c2ef629e1f8ca8280b935769b5e",
+    "src/activities/settings/PluginHubInstallActivity.cpp": "f7b7427a37c6980737026644b71afbf71e50becf53e26720038e9338321d0882",
+    "src/util/PluginLocations.h": "a2964560483a4f56ee74a36ef48e998d2d8db805e071e77b8b8271c2527e469f"
+  },
+  "files": {
+    "DEVICE.md": "9fe4e850220a321fc41ecafc140b3f012e7a516b64470b2e812bcc1985ee6136",
+    "LICENSE": "5d025639b5237e35cf93c4ca598ebde40f31f032bf9a9a19fceb3703dca68b84",
+    "README.md": "6294623d812926e1905951e6ab6961a932f44c4672d00c019375083067e4a618",
+    "VALIDATION.md": "05ffe30a149528561994a9103659b954ee8f9b75f8104687bcc6eeca29f003c7",
+    "host/FlowTest.cpp": "2e7418e3c1a30bd8ed9a61b87e0268c0e66d7c0087838c532b80c045417d97ab",
+    "host/LayoutProbe.cpp": "cb662ea4f09c0a6cced31ac7edbf90791807455ee631274b3a6912b5bd00a711",
+    "host/render.py": "e80d6476051f43fe9f4882ef1d2de64af5d01f7d3080f8f3a4d3fbe82d605659",
+    "host/run.py": "e1ba7447063640d24067cf1c2406313590646915e26aa8413257c865cfa4ef10",
+    "reproduce.py": "9fe93843fa77b5a8c64e96d5e44e45411c7aa041731fd69c128075b9f0138796",
+    "ux1.patch": "d8688a51b42b7da5d563e5e3792cb92651b0e93b383895c1bcdfd6b4ebfcfdef",
+    "ux2.patch": "663188e9a82f2239d6a9c927d644ea0eb763f17f3f35d44a029dcf27f2aafd28"
+  }
+}

@@ -1,0 +1,80 @@
+diff --git a/src/activities/plugins/PluginCatalogActivity.cpp b/src/activities/plugins/PluginCatalogActivity.cpp
+index 0355cd2..fec2955 100644
+--- a/src/activities/plugins/PluginCatalogActivity.cpp
++++ b/src/activities/plugins/PluginCatalogActivity.cpp
+@@ -204,6 +204,14 @@ std::vector<PluginRef> discoverPlugins() {
+     if (e.hasDevice) readPluginMetadata(ref.manifestPath, ref, true);
+     plugins.push_back(std::move(ref));
+   }
++  // Resolve duplicate directories before ordering the visible picker entries.
++  std::sort(plugins.begin(), plugins.end(), [](const PluginRef& a, const PluginRef& b) {
++    const bool aHub = a.name == PluginLocations::PLUGIN_HUB_NAME;
++    const bool bHub = b.name == PluginLocations::PLUGIN_HUB_NAME;
++    if (aHub != bHub) return aHub;
++    const int titleOrder = strcasecmp(a.title.c_str(), b.title.c_str());
++    return titleOrder != 0 ? titleOrder < 0 : a.name < b.name;
++  });
+   return plugins;
+ }
+ 
+@@ -462,7 +470,12 @@ void PluginCatalogActivity::enterPluginPicker() {
+   errorMessage.clear();
+   session.reset();  // no TLS while only picking
+   state = State::PLUGIN_PICKER;
+-  if (pickerReturnRow > 0 && pickerReturnRow < rowCount()) moveSelectionTo(pickerReturnRow);
++  const auto previous = std::find_if(installedPlugins.begin(), installedPlugins.end(),
++                                     [this](const PluginRef& plugin) { return plugin.name == pickerReturnName; });
++  if (previous != installedPlugins.end()) {
++    const int prefixRows = (showOpds ? 1 : 0) + (showPluginHubInstallRow ? 1 : 0);
++    moveSelectionTo(prefixRows + static_cast<int>(previous - installedPlugins.begin()));
++  }
+   requestUpdate();
+ }
+ 
+@@ -1234,7 +1247,7 @@ void PluginCatalogActivity::activateIndex(const int index) {
+     }
+     if (action != PluginLocations::PickerAction::Catalog) return;
+     app.clearTapFlash();  // the row leaves this screen
+-    pickerReturnRow = index;
++    pickerReturnName = plugin.name;
+     manifestPath = plugin.manifestPath;
+     catalogTitle = plugin.title;
+     enterCatalog();
+diff --git a/src/activities/plugins/PluginCatalogActivity.h b/src/activities/plugins/PluginCatalogActivity.h
+index 87ab90e..572d150 100644
+--- a/src/activities/plugins/PluginCatalogActivity.h
++++ b/src/activities/plugins/PluginCatalogActivity.h
+@@ -131,7 +131,7 @@ class PluginCatalogActivity final : public CatalogActivity {
+   OptionPopup pluginHubPopup;
+   bool showOpds = false;
+   bool rootMode = false;
+-  int pickerReturnRow = 0;  // picker row to reselect after leaving a catalog
++  std::string pickerReturnName;  // folder identity to reselect after leaving a catalog
+   std::vector<Item> items;
+   // Row buffer over items/browseLists plus the synthetic pager rows; rebuilt
+   // lazily on the render task whenever rowsDirty (items or state changed).
+diff --git a/src/activities/settings/PluginHubInstallActivity.cpp b/src/activities/settings/PluginHubInstallActivity.cpp
+index 70fc185..ec3ceec 100644
+--- a/src/activities/settings/PluginHubInstallActivity.cpp
++++ b/src/activities/settings/PluginHubInstallActivity.cpp
+@@ -26,7 +26,7 @@ PluginHubInstallActivity::PluginHubInstallActivity(GfxRenderer& renderer, Mapped
+     : CatalogActivity("PluginHubInstall", renderer, mappedInput), showConfirmation(showConfirmation) {}
+ 
+ bool PluginHubInstallActivity::isAvailable() {
+-  const std::string dir = PluginLocations::findPluginDirOnDisk("pluginhub");
++  const std::string dir = PluginLocations::findPluginDirOnDisk(PluginLocations::PLUGIN_HUB_NAME);
+   return !dir.empty() && !PluginLocations::isPluginQuarantined(dir) && Storage.exists((dir + "/device.json").c_str());
+ }
+ 
+diff --git a/src/util/PluginLocations.h b/src/util/PluginLocations.h
+index 7a7128b..fbb0c89 100644
+--- a/src/util/PluginLocations.h
++++ b/src/util/PluginLocations.h
+@@ -10,6 +10,7 @@
+ namespace PluginLocations {
+ inline constexpr const char* ROOTS[] = {"/.crosspoint/plugins", "/plugins", "/.plugins"};
+ inline constexpr size_t ROOT_COUNT = sizeof(ROOTS) / sizeof(ROOTS[0]);
++inline constexpr const char* PLUGIN_HUB_NAME = "pluginhub";
+ inline constexpr const char* INSTALL_MARKER = ".installing";
+ 
+ inline bool isPluginRoot(const std::string& dir) {

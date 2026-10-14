@@ -1,0 +1,33 @@
+{
+  "cp": {
+    "url": "https://github.com/crosspoint-reader/crosspoint-reader.git",
+    "commit": "5e8b503f4ddefe94abe90b3b67ec3812b9a8273f"
+  },
+  "sdk": {
+    "url": "https://github.com/Free-Ink/freeink-sdk.git",
+    "commit": "7fcd3b34c108f28c086ade3b433924022dbc0998"
+  },
+  "gtest": {
+    "url": "https://github.com/google/googletest.git",
+    "commit": "52eb8108c5bdec04579160ae17225d66034bd723"
+  },
+  "patchOrder": [
+    "ux1.patch"
+  ],
+  "resultFiles": {
+    "src/activities/plugins/PluginCatalogActivity.cpp": "6337d208435a93d5c523a2fdbf46c610ab4e7cff8d41cacd5d8e321ef907ce05",
+    "src/activities/plugins/PluginCatalogActivity.h": "5a82ad3aff18fee130cbabe0fa8e8e9550ca2462450c6c2b622e87449aa11b08",
+    "src/activities/settings/PluginHubInstallActivity.cpp": "f7b7427a37c6980737026644b71afbf71e50becf53e26720038e9338321d0882",
+    "src/util/PluginLocations.h": "a2964560483a4f56ee74a36ef48e998d2d8db805e071e77b8b8271c2527e469f"
+  },
+  "files": {
+    "DEVICE.md": "9fe4e850220a321fc41ecafc140b3f012e7a516b64470b2e812bcc1985ee6136",
+    "LICENSE": "5d025639b5237e35cf93c4ca598ebde40f31f032bf9a9a19fceb3703dca68b84",
+    "README.md": "ba4a33747dbda884f60f23e8e1b4cd62214efda42f6c39aca0f1dc69faad13d3",
+    "VALIDATION.md": "133f192d40e8a3b2d101b749c7cdf28456b0b3f82d18cef24cb8c0234ea2c9dc",
+    "host/PickerOrderTest.cpp": "920c152d84ae28faf8da18cbc60eae383b3a90cac2058955199d363a19500616",
+    "host/run.py": "bcda0d9e032767c984165dc52affd4771116b40d2d8c519cbf45e52dd1fe6b58",
+    "reproduce.py": "9fe93843fa77b5a8c64e96d5e44e45411c7aa041731fd69c128075b9f0138796",
+    "ux1.patch": "d8688a51b42b7da5d563e5e3792cb92651b0e93b383895c1bcdfd6b4ebfcfdef"
+  }
+}
