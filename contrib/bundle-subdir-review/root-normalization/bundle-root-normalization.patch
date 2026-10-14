@@ -1,0 +1,13 @@
+diff --git a/src/activities/plugins/PluginCatalogActivity.cpp b/src/activities/plugins/PluginCatalogActivity.cpp
+index 0355cd2..4f10259 100644
+--- a/src/activities/plugins/PluginCatalogActivity.cpp
++++ b/src/activities/plugins/PluginCatalogActivity.cpp
+@@ -903,7 +903,7 @@ HttpDownloader::DownloadError PluginCatalogActivity::downloadBundle(const Item&
+     return HttpDownloader::FILE_ERROR;
+   }
+   std::string root = downloadDir();
+-  if (!root.empty() && root.back() == '/') root.pop_back();
++  while (!root.empty() && root.back() == '/') root.pop_back();
+   std::string dir;
+   if (PluginLocations::shouldReuseInstalledBundleDir(root, subdir)) {
+     dir = PluginLocations::findPluginDir(subdir.c_str());

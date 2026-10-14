@@ -1,0 +1,26 @@
+{
+  "cp": {
+    "url": "https://github.com/crosspoint-reader/crosspoint-reader.git",
+    "commit": "5e8b503f4ddefe94abe90b3b67ec3812b9a8273f",
+    "author": "jadehawk",
+    "pr": 3877
+  },
+  "sdkPin": "7fcd3b34c108f28c086ade3b433924022dbc0998",
+  "googletest": {
+    "url": "https://github.com/google/googletest.git",
+    "commit": "52eb8108c5bdec04579160ae17225d66034bd723"
+  },
+  "patchSha256": "a814c4a60cb64ad8f06f137fca8c118394b259dbb24989a2e5edfc7154991f03",
+  "resultSha256": "adf11ac56fc26bc6cc27fe3d3266867539ad1ba6899a682d4a1a29b08a234f5e",
+  "files": {
+    "LICENSE": "5d025639b5237e35cf93c4ca598ebde40f31f032bf9a9a19fceb3703dca68b84",
+    "README.md": "241755728daaad872f49a733b157aad3f67520e9ec7b1b362c3a2c2e01ba8f67",
+    "bundle-root-normalization.patch": "a814c4a60cb64ad8f06f137fca8c118394b259dbb24989a2e5edfc7154991f03",
+    "host/PluginBundleFlowTest.cpp": "1be1adde801f9dd1865b69f351bfec81f5566a312fe049e8d14b4cda80de61b8",
+    "host/stubs/CrossPointSettings.h": "538a5ae8b6cdc639555a70d9f9a83e24f3c419ae3446c453455c5c61f5602039",
+    "host/stubs/HalStorage.h": "5d63c45cf78a701d7018e87ecab78485d9ce6eed18ae75b71e4fc752ac4b18ce",
+    "reproduce.py": "d4158bd818c072a91e5ca220a618d234e552786a472482c69c541dcad0fb7d22",
+    "run_host.py": "1e7d5a4d30bee5f9b4b607af66dcd9d9ba363729de8ee422d43134ed45fd8c07",
+    "VALIDATION.md": "7df95db4204279b7259d304ecd960c3bac31a9d621dd6c1413d6aaee0f4247b7"
+  }
+}
