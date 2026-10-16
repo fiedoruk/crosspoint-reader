@@ -1,0 +1,1025 @@
+diff --git a/docs/timed-wake-testing.md b/docs/timed-wake-testing.md
+index 4b3c4df1..4420e277 100644
+--- a/docs/timed-wake-testing.md
++++ b/docs/timed-wake-testing.md
+@@ -33,7 +33,47 @@ For each device under test:
+ 
+ Please report the exact device, panel/controller variant when known, whether the test was battery-only, the selected interval, and which steps passed or failed.
+ 
+-## Current validation status
++## Power during a timed refresh
++
++The expected behavior is to retain Power while SD or panel I/O blocks the main
++task; confirm this on the device being tested. The panel transfer may finish
++before the reader resumes. A software restart restores the ordinary wake path,
++so partly shut-down peripherals are initialized normally. No reader position is
++written by this handoff.
++
++The GPIO capture retains a request; one static software timer on the existing
++FreeRTOS timer daemon samples the held level while main is blocked. A press is
++verified only while still held after at least 10 ms. A delayed release ISR alone
++cannot establish its physical duration. An unverified contact follows the saved **Short Power Button Press** preference:
++**Sleep** permits the click; otherwise it returns to the configured timer cadence.
++This is separate from the long-press duration used to put an awake reader to sleep.
++
++Test Power before refresh, during panel transfer and just as the device returns
++to sleep, with both short-press settings. Confirm the same book position resumes
++and the release does not immediately put it back to sleep. Also check timer Off,
++ordinary button-only wake and the four orientations. The change adds no touch or
++remapping behavior. Capture setup failure stops periodic refresh rather than
++running a maintenance cycle without Power capture.
++
++Host regression checks:
++
++```sh
++python3 test/timed_power_wake/run.py --baseline 59555361aef55608cc56fdb5a9fccc167c37db34
++python3 test/timer_wake_arm/run.py
++```
++
++The first command checks the patched handoff and production capture methods and
++requires the unpatched timer branch to reproduce the lost press (exit 42),
++with simulated GPIO, clock and restart boundaries. The tests do not qualify the
++physical input controller or panel timing.
++The last capture check follows Power-wake arming. Pulses completed wholly inside
++the subsequent SDK sleep-entry operation remain a hardware timing boundary;
++these host checks do not establish a no-loss guarantee there.
++
++## Baseline validation status
++
++The observations below belong to timedwake-r1 (`5955536`). They do not qualify
++the later Power handoff; repeat the relevant device checks on the actual candidate.
+ 
+ | Device | Build path | Battery-only timed rotation | Off disables timer | Normal wake | Status |
+ | --- | --- | --- | --- | --- | --- |
+diff --git a/lib/hal/HalGPIO.cpp b/lib/hal/HalGPIO.cpp
+index 44c6e9c4..11e05724 100644
+--- a/lib/hal/HalGPIO.cpp
++++ b/lib/hal/HalGPIO.cpp
+@@ -5,7 +5,10 @@
+ #include <Preferences.h>
+ #include <SPI.h>
+ #include <XteinkDetect.h>
++#include <driver/gpio.h>
+ #include <esp_sleep.h>
++#include <esp_timer.h>
++#include <hal/gpio_ll.h>
+ 
+ // Global HalGPIO instance
+ HalGPIO gpio;
+@@ -197,6 +200,100 @@ bool HalGPIO::isXteinkDevice() const {
+          BoardConfig::ACTIVE.board == BoardConfig::Board::XteinkX4;
+ }
+ 
++void IRAM_ATTR HalGPIO::recordPowerWake(const bool pressed, const uint32_t nowUs) {
++  if (pressed && !powerCaptureDown) {
++    if (powerCaptureRequest == PowerWakeRequest::None) powerCaptureRequest = PowerWakeRequest::Pressed;
++    powerCaptureStartUs = nowUs;
++  } else if (pressed && powerCaptureDown && nowUs - powerCaptureStartUs >= POWER_WAKE_STABILITY_MS * 1000U) {
++    powerCaptureRequest = PowerWakeRequest::Verified;
++  }
++  powerCaptureDown = pressed;
++}
++
++void IRAM_ATTR HalGPIO::capturePowerWake(void* context) {
++  auto* self = static_cast<HalGPIO*>(context);
++  portENTER_CRITICAL_ISR(&self->powerCaptureMux);
++  if (self->powerCapturePin >= 0) {
++    // Retain an edge even if press/release coalesced before this ISR ran.
++    if (self->powerCaptureRequest == PowerWakeRequest::None) self->powerCaptureRequest = PowerWakeRequest::Pressed;
++    const bool pressed = gpio_ll_get_level(&GPIO, self->powerCapturePin) == self->powerCaptureLevel;
++    if (pressed) self->powerCaptureDown = false;  // A queued edge may include an intervening release.
++    self->recordPowerWake(pressed, static_cast<uint32_t>(esp_timer_get_time()));
++  }
++  portEXIT_CRITICAL_ISR(&self->powerCaptureMux);
++}
++
++void HalGPIO::verifyPowerWake(TimerHandle_t timer) {
++  static_cast<HalGPIO*>(pvTimerGetTimerID(timer))->powerWakeRequest();
++}
++
++bool HalGPIO::beginPowerWakeCapture() {
++  endPowerWakeCapture();
++  const int8_t pin = BoardConfig::ACTIVE.input.power;
++  if (pin < 0) return false;
++  if (!powerVerifyTimer) {
++    constexpr TickType_t pollTicks = pdMS_TO_TICKS(POWER_WAKE_STABILITY_MS / 2);
++    powerVerifyTimer =
++        xTimerCreateStatic("PowerWake", pollTicks ? pollTicks : 1, pdTRUE, this, verifyPowerWake, &powerVerifyStorage);
++    if (!powerVerifyTimer) {
++      LOG_ERR("GPIO", "Power verification timer unavailable");
++      return false;
++    }
++  }
++  const auto installed = gpio_install_isr_service(0);
++  if (installed != ESP_OK && installed != ESP_ERR_INVALID_STATE) {
++    LOG_ERR("GPIO", "Power capture service failed: %d", static_cast<int>(installed));
++    return false;
++  }
++  const auto configured = gpio_set_intr_type(static_cast<gpio_num_t>(pin), GPIO_INTR_ANYEDGE);
++  if (configured != ESP_OK) {
++    LOG_ERR("GPIO", "Power capture edge failed: %d", static_cast<int>(configured));
++    return false;
++  }
++  powerCapturePin = pin;
++  powerCaptureLevel = BoardConfig::ACTIVE.input.powerActiveHigh ? HIGH : LOW;
++  const auto attached = gpio_isr_handler_add(static_cast<gpio_num_t>(pin), capturePowerWake, this);
++  if (attached != ESP_OK) {
++    LOG_ERR("GPIO", "Power capture handler failed: %d", static_cast<int>(attached));
++    gpio_intr_disable(static_cast<gpio_num_t>(pin));
++    powerCapturePin = -1;
++    return false;
++  }
++  powerWakeRequest();  // Include a button already down when capture starts.
++  // The existing timer daemon samples a held level while main is blocked in I/O.
++  if (xTimerStart(powerVerifyTimer, 0) != pdPASS) {
++    LOG_ERR("GPIO", "Power verification timer start failed");
++    endPowerWakeCapture();
++    return false;
++  }
++  return true;
++}
++
++HalGPIO::PowerWakeRequest HalGPIO::powerWakeRequest() {
++  portENTER_CRITICAL(&powerCaptureMux);
++  if (powerCapturePin >= 0) {
++    recordPowerWake(gpio_ll_get_level(&GPIO, powerCapturePin) == powerCaptureLevel,
++                    static_cast<uint32_t>(esp_timer_get_time()));
++  }
++  const auto request = powerCaptureRequest;
++  portEXIT_CRITICAL(&powerCaptureMux);
++  return request;
++}
++
++void HalGPIO::endPowerWakeCapture() {
++  // A queued callback is harmless after the pin is cleared; storage lives with gpio.
++  if (powerVerifyTimer) xTimerStop(powerVerifyTimer, 0);
++  if (powerCapturePin >= 0) {
++    gpio_intr_disable(static_cast<gpio_num_t>(powerCapturePin));
++    gpio_isr_handler_remove(static_cast<gpio_num_t>(powerCapturePin));
++  }
++  portENTER_CRITICAL(&powerCaptureMux);
++  powerCapturePin = -1;
++  powerCaptureRequest = PowerWakeRequest::None;
++  powerCaptureDown = false;
++  portEXIT_CRITICAL(&powerCaptureMux);
++}
++
+ bool HalGPIO::verifyPowerButtonWakeup() {
+   // M5Paper v1.1: the classic ESP32's reset-to-setup() latency exceeds a normal
+   // wheel click, so a click wake is always released before this samples and
+@@ -206,7 +303,6 @@ bool HalGPIO::verifyPowerButtonWakeup() {
+     return true;
+   }
+ 
+-  constexpr unsigned long POWER_WAKE_STABILITY_MS = 10;
+   const bool heldAtFirstSample = inputMgr.isPowerButtonPhysicallyPressed();
+   const unsigned long sampleStart = millis();
+   inputMgr.update();
+diff --git a/lib/hal/HalGPIO.h b/lib/hal/HalGPIO.h
+index 5909b32a..997249c7 100644
+--- a/lib/hal/HalGPIO.h
++++ b/lib/hal/HalGPIO.h
+@@ -2,6 +2,7 @@
+ 
+ #include <Arduino.h>
+ #include <InputManager.h>
++#include <freertos/timers.h>
+ 
+ #include "WakeupClassify.h"
+ 
+@@ -41,6 +42,11 @@
+ #define QMI8658_WHO_AM_I_VALUE 0x05  // WHO_AM_I expected value
+ 
+ class HalGPIO {
++ public:
++  enum class PowerWakeRequest { None, Pressed, Verified };
++  static constexpr uint32_t POWER_WAKE_STABILITY_MS = 10;
++
++ private:
+ #if CROSSPOINT_EMULATED == 0
+   InputManager inputMgr;
+ #endif
+@@ -49,6 +55,17 @@ class HalGPIO {
+   bool usbStateChanged = false;
+   uint8_t previousCapacitivePageButtons = 0;
+   bool capacitivePagePressed = false;
++  portMUX_TYPE powerCaptureMux = portMUX_INITIALIZER_UNLOCKED;
++  int8_t powerCapturePin = -1;
++  uint8_t powerCaptureLevel = 0;
++  PowerWakeRequest powerCaptureRequest = PowerWakeRequest::None;
++  bool powerCaptureDown = false;
++  uint32_t powerCaptureStartUs = 0;
++  StaticTimer_t powerVerifyStorage{};
++  TimerHandle_t powerVerifyTimer = nullptr;
++  void IRAM_ATTR recordPowerWake(bool pressed, uint32_t nowUs);
++  static void IRAM_ATTR capturePowerWake(void* context);
++  static void verifyPowerWake(TimerHandle_t timer);
+ 
+  public:
+   enum class DeviceType : uint8_t { X4, X3 };
+@@ -124,6 +141,11 @@ class HalGPIO {
+   // Should only be called when wakeup reason is PowerButton.
+   bool verifyPowerButtonWakeup();
+ 
++  // Retain Power edges while a timer wake is blocked in SD or panel I/O.
++  bool beginPowerWakeCapture();
++  PowerWakeRequest powerWakeRequest();
++  void endPowerWakeCapture();
++
+   // Check if USB is connected
+   bool isUsbConnected() const;
+ 
+diff --git a/lib/hal/HalPowerManager.cpp b/lib/hal/HalPowerManager.cpp
+index 3ea98ca0..67e77284 100644
+--- a/lib/hal/HalPowerManager.cpp
++++ b/lib/hal/HalPowerManager.cpp
+@@ -75,20 +75,26 @@ void HalPowerManager::setPowerSaving(bool enabled) {
+   xSemaphoreGive(modeMutex);
+ }
+ 
+-void HalPowerManager::startDeepSleep(HalGPIO& gpio, uint64_t timerWakeUs) const {
+-  bool timerWakeArmed = false;
++void HalPowerManager::startDeepSleep(HalGPIO& gpio, uint64_t timerWakeUs, bool fromTimerWake) const {
++  if (fromTimerWake && gpio.powerWakeRequest() != HalGPIO::PowerWakeRequest::None) return;
++  const auto clearTimer = [] {
++    const auto disabled = esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
++    if (disabled != ESP_OK && disabled != ESP_ERR_INVALID_STATE) {
++      LOG_ERR("PWR", "Timer wake disable failed: %d; restarting", static_cast<int>(disabled));
++      esp_restart();
++    }
++  };
++  [[maybe_unused]] bool timerWakeArmed = false;
+   if (timerWakeUs > 0) {
+     const auto result = esp_sleep_enable_timer_wakeup(timerWakeUs);
+     if (result == ESP_OK) {
+       timerWakeArmed = true;
+     } else {
+       LOG_ERR("PWR", "Timer wake arming failed: %d", static_cast<int>(result));
+-      const auto disabled = esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+-      if (disabled != ESP_OK && disabled != ESP_ERR_INVALID_STATE) {
+-        LOG_ERR("PWR", "Timer wake disable failed: %d; restarting", static_cast<int>(disabled));
+-        esp_restart();
+-      }
++      clearTimer();
+     }
++  } else {
++    clearTimer();
+   }
+ #if FREEINK_DEVICE_EEGO_A4
+   // LM3630A and GSL share I2C; turn the light off before touch releases the bus.
+@@ -178,9 +184,15 @@ void HalPowerManager::startDeepSleep(HalGPIO& gpio, uint64_t timerWakeUs) const
+   freeink::metalio::powerOff();
+ #endif
+ 
+-  // Waits for the power button to be physically released (so holding it doesn't
+-  // immediately wake the device again), then arms the wake source and sleeps.
+-  freeink::PowerManager::deepSleepUntilPowerButton();
++  if (fromTimerWake) {
++    if (gpio.powerWakeRequest() != HalGPIO::PowerWakeRequest::None) return;
++    // A press arriving during teardown must wake the reader, not be consumed.
++    freeink::PowerManager::armPowerButtonWakeup();
++    if (gpio.powerWakeRequest() != HalGPIO::PowerWakeRequest::None) return;
++    freeink::PowerManager::deepSleep();
++  } else {
++    freeink::PowerManager::deepSleepUntilPowerButton();
++  }
+ }
+ 
+ uint16_t HalPowerManager::getBatteryPercentage() const {
+diff --git a/lib/hal/HalPowerManager.h b/lib/hal/HalPowerManager.h
+index 033409e8..a1d68aca 100644
+--- a/lib/hal/HalPowerManager.h
++++ b/lib/hal/HalPowerManager.h
+@@ -42,7 +42,7 @@ class HalPowerManager {
+   // Should be called inside main loop() to handle the currentLockMode
+   // timerWakeUs requests an ESP-IDF one-shot timer in microseconds; zero adds
+   // no timer. Existing button-wake behavior remains the default.
+-  void startDeepSleep(HalGPIO& gpio, uint64_t timerWakeUs = 0) const;
++  void startDeepSleep(HalGPIO& gpio, uint64_t timerWakeUs = 0, bool fromTimerWake = false) const;
+ 
+   // Get battery percentage (range 0-100)
+   uint16_t getBatteryPercentage() const;
+diff --git a/src/main.cpp b/src/main.cpp
+index 32a2f7aa..931505b3 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -434,6 +434,33 @@ void setupDisplayAndFonts(bool seamless = false) {
+   LOG_DBG("MAIN", "Fonts setup");
+ }
+ 
++RTC_NOINIT_ATTR uint32_t timedPowerWakeStamp;
++static constexpr uint32_t TIMED_POWER_PRESS = 0x54505750;
++static constexpr uint32_t TIMED_POWER_VERIFIED = 0x54505756;
++
++static HalGPIO::PowerWakeRequest consumeTimedPowerWake() {
++  const uint32_t stamp = timedPowerWakeStamp;
++  timedPowerWakeStamp = 0;
++  if (esp_reset_reason() != ESP_RST_SW) return HalGPIO::PowerWakeRequest::None;
++  if (stamp == TIMED_POWER_VERIFIED) return HalGPIO::PowerWakeRequest::Verified;
++  if (stamp == TIMED_POWER_PRESS) return HalGPIO::PowerWakeRequest::Pressed;
++  return HalGPIO::PowerWakeRequest::None;
++}
++
++static void restartForTimerPower() {
++  auto request = gpio.powerWakeRequest();
++  if (request == HalGPIO::PowerWakeRequest::None) return;
++  // Finish the normal 10 ms stability check if the press arrived at teardown.
++  const uint32_t started = millis();
++  while (request == HalGPIO::PowerWakeRequest::Pressed && millis() - started < HalGPIO::POWER_WAKE_STABILITY_MS) {
++    delay(1);
++    request = gpio.powerWakeRequest();
++  }
++  timedPowerWakeStamp = request == HalGPIO::PowerWakeRequest::Verified ? TIMED_POWER_VERIFIED : TIMED_POWER_PRESS;
++  gpio.endPowerWakeCapture();
++  ESP.restart();  // Peripherals may already be down; resume through ordinary boot.
++}
++
+ void setup() {
+   BoardConfig::holdPowerRails();
+ 
+@@ -467,13 +494,17 @@ void setup() {
+   gpio.begin();
+   powerManager.begin();
+ 
+-  const auto wakeupReason = gpio.getWakeupReason();
++  const auto resumedTimerPower = consumeTimedPowerWake();
++  const auto wakeupReason = resumedTimerPower != HalGPIO::PowerWakeRequest::None ? HalGPIO::WakeupReason::PowerButton
++                                                                                 : gpio.getWakeupReason();
++  const bool timerPowerCaptureReady = wakeupReason != HalGPIO::WakeupReason::Timer || gpio.beginPowerWakeCapture();
+   // Sample the wake hold now — a click wake is released within milliseconds of
+   // boot — but defer the sleep-or-boot decision until SETTINGS is loaded below:
+   // click-to-wake is a setting, and an X4 battery power-off cuts all power, so
+   // only SD state survives to the next boot.
+   // The Metalio boots after the button is released, so it skips the check.
+-  const bool wakeHoldVerified = wakeupReason != HalGPIO::WakeupReason::PowerButton || BoardConfig::isMetalioEInk4() ||
++  const bool wakeHoldVerified = resumedTimerPower == HalGPIO::PowerWakeRequest::Verified ||
++                                wakeupReason != HalGPIO::WakeupReason::PowerButton || BoardConfig::isMetalioEInk4() ||
+                                 gpio.verifyPowerButtonWakeup();
+ 
+   // X4 Pro and X4 Classic both map BTN_UP to GPIO0 — an ESP32-S3 boot strap — so
+@@ -500,7 +531,9 @@ void setup() {
+       // An unattended maintenance wake must never strand the reader awake.
+       // Settings live on SD, so do not re-arm a timer we can no longer verify.
+       halTiltSensor.deepSleep();
+-      powerManager.startDeepSleep(gpio);
++      powerManager.startDeepSleep(gpio, 0, true);
++      restartForTimerPower();
++      ESP.restart();
+       return;
+     }
+     setupDisplayAndFonts(isSilentReboot);
+@@ -546,25 +579,31 @@ void setup() {
+   // reboots replay the live state captured at restart, so they neither go dark
+   // nor light up against the user's wake preference.
+   const bool restoreLightOn = wakeupReason == HalGPIO::WakeupReason::Timer ? false
+-                              : isSilentReboot                             ? silentRebootLightOn
++                              : isSilentReboot ? silentRebootLightOn
+                                                : (SETTINGS.frontlightOn != 0 && SETTINGS.frontlightRestoreOnWake != 0);
+   Frontlight.begin(SETTINGS.frontlightBrightness, SETTINGS.frontlightWarmth, restoreLightOn);
+ 
+   switch (wakeupReason) {
+     case HalGPIO::WakeupReason::Timer: {
+-      const uint64_t timerWakeUs = timedSleepScreenRefreshUs();
++      restartForTimerPower();
++      const uint64_t timerWakeUs =
++          timerPowerCaptureReady && !isSilentReboot && !rebootedFromPanic ? timedSleepScreenRefreshUs() : 0;
+       LOG_DBG("MAIN", "Wakeup reason: Timer; timed sleep refresh interval=%llu us",
+               static_cast<unsigned long long>(timerWakeUs));
+       if (timerWakeUs > 0) {
+         setupDisplayAndFonts(/*seamless=*/true);
+         display.setInverted(false);
++        restartForTimerPower();
+         SleepActivity timedSleep(renderer, mappedInputManager);
+         timedSleep.renderTimedSleepScreen();
++        restartForTimerPower();
+         display.deepSleep();
+       }
+       halTiltSensor.deepSleep();
+       Storage.prepareForDeepSleep();
+-      powerManager.startDeepSleep(gpio, timerWakeUs);
++      powerManager.startDeepSleep(gpio, timerWakeUs, true);
++      restartForTimerPower();
++      ESP.restart();
+       break;
+     }
+     case HalGPIO::WakeupReason::PowerButton:
+@@ -573,7 +612,9 @@ void setup() {
+       if (!wakeHoldVerified && SETTINGS.shortPwrBtn != CrossPointSettings::SHORT_PWRBTN::SLEEP) {
+         LOG_DBG("MAIN", "Power-button wake not held through verification, sleeping");
+         Storage.prepareForDeepSleep();
+-        powerManager.startDeepSleep(gpio);
++        const uint64_t timerWakeUs =
++            resumedTimerPower != HalGPIO::PowerWakeRequest::None ? timedSleepScreenRefreshUs() : 0;
++        powerManager.startDeepSleep(gpio, timerWakeUs);
+       }
+       wakePowerReleasePending = true;
+       break;
+diff --git a/test/timed_power_wake/CaptureTest.cpp b/test/timed_power_wake/CaptureTest.cpp
+new file mode 100644
+index 00000000..fafe9136
+--- /dev/null
++++ b/test/timed_power_wake/CaptureTest.cpp
+@@ -0,0 +1,179 @@
++#include <HalGPIO.h>
++
++#include <cassert>
++#include <cstdio>
++
++#define LOG_ERR(...)
++using gpio_num_t = int;
++constexpr int ESP_OK = 0, ESP_ERR_INVALID_STATE = 1, GPIO_INTR_ANYEDGE = 3;
++static int serviceResult = 0, edgeResult = 0, attachResult = 0;
++static int level = HIGH, removes = 0, disables = 0;
++static uint64_t nowUs = 0;
++static void (*handler)(void*) = nullptr;
++static void* argument = nullptr;
++static bool createTimerFails = false, startTimerFails = false, stopTimerFails = false;
++static TimerHandle_t timer = nullptr;
++TimerHandle_t xTimerCreateStatic(const char*, TickType_t ticks, int repeat, void* id, TimerCallbackFunction_t callback,
++                                 StaticTimer_t* storage) {
++  assert(ticks == 5 && repeat == pdTRUE);
++  if (createTimerFails) return nullptr;
++  *storage = {id, callback, false};
++  timer = storage;
++  return timer;
++}
++int xTimerStart(TimerHandle_t t, TickType_t wait) {
++  assert(wait == 0);
++  if (startTimerFails) return 0;
++  t->active = true;
++  return pdPASS;
++}
++int xTimerStop(TimerHandle_t t, TickType_t wait) {
++  assert(wait == 0);
++  if (stopTimerFails) return 0;
++  t->active = false;
++  return pdPASS;
++}
++void* pvTimerGetTimerID(TimerHandle_t t) { return t->id; }
++static void sample() {
++  if (timer && timer->active) timer->callback(timer);
++}
++struct {
++} GPIO;
++int gpio_ll_get_level(decltype(GPIO)*, int pin) {
++  assert(pin == 3);
++  return level;
++}
++int64_t esp_timer_get_time() { return nowUs; }
++int gpio_install_isr_service(int flags) {
++  assert(flags == 0);
++  return serviceResult;
++}
++int gpio_set_intr_type(gpio_num_t pin, int type) {
++  assert(pin == 3 && type == GPIO_INTR_ANYEDGE);
++  return edgeResult;
++}
++int gpio_isr_handler_add(gpio_num_t pin, void (*callback)(void*), void* context) {
++  assert(pin == 3);
++  if (attachResult != ESP_OK) return attachResult;
++  handler = callback;
++  argument = context;
++  return ESP_OK;
++}
++int gpio_intr_disable(gpio_num_t pin) {
++  assert(pin == 3);
++  ++disables;
++  return ESP_OK;
++}
++int gpio_isr_handler_remove(gpio_num_t pin) {
++  assert(pin == 3);
++  ++removes;
++  handler = nullptr;
++  argument = nullptr;
++  return ESP_OK;
++}
++namespace BoardConfig {
++struct {
++  struct {
++    int8_t power = 3;
++    bool powerActiveHigh = false;
++  } input;
++} ACTIVE;
++}  // namespace BoardConfig
++
++#include "CaptureSource.inc"
++
++static void edge(bool pressed) {
++  level = pressed == BoardConfig::ACTIVE.input.powerActiveHigh ? HIGH : LOW;
++  if (handler) handler(argument);
++}
++
++int main() {
++  using Request = HalGPIO::PowerWakeRequest;
++  HalGPIO gpio;
++  createTimerFails = true;
++  assert(!gpio.beginPowerWakeCapture());
++  createTimerFails = false;
++  assert(gpio.beginPowerWakeCapture() && handler);
++  assert(gpio.powerWakeRequest() == Request::None);
++  edge(true);
++  nowUs += 15000;
++  sample();  // The timer daemon runs while the main task is blocked.
++  edge(false);
++  assert(gpio.powerWakeRequest() == Request::Verified);  // No polling during the press.
++  gpio.endPowerWakeCapture();
++  assert(!handler && removes == 1 && gpio.powerWakeRequest() == Request::None);
++
++  assert(gpio.beginPowerWakeCapture());
++  handler(argument);  // Both edges happened before the ISR; the pin is released.
++  assert(gpio.powerWakeRequest() == Request::Pressed);
++  gpio.endPowerWakeCapture();
++
++  assert(gpio.beginPowerWakeCapture());
++  edge(true);
++  nowUs += 5000;
++  level = HIGH;  // Physical release; defer the GPIO ISR until 15 ms.
++  nowUs += 10000;
++  sample();
++  handler(argument);
++  assert(gpio.powerWakeRequest() == Request::Pressed);
++  gpio.endPowerWakeCapture();
++
++  assert(gpio.beginPowerWakeCapture());
++  edge(true);
++  nowUs += 9000;
++  edge(false);
++  assert(gpio.powerWakeRequest() == Request::Pressed);
++  gpio.endPowerWakeCapture();
++
++  edge(true);
++  assert(gpio.beginPowerWakeCapture());
++  nowUs += 10000;
++  assert(gpio.powerWakeRequest() == Request::Verified);
++  edge(false);
++  gpio.endPowerWakeCapture();
++
++  nowUs = UINT32_MAX - 5000ULL;
++  assert(gpio.beginPowerWakeCapture());
++  edge(true);
++  nowUs += 10000;
++  sample();
++  edge(false);
++  assert(gpio.powerWakeRequest() == Request::Verified);
++  gpio.endPowerWakeCapture();
++
++  serviceResult = ESP_ERR_INVALID_STATE;
++  BoardConfig::ACTIVE.input.powerActiveHigh = true;
++  edge(false);
++  assert(gpio.beginPowerWakeCapture());
++  edge(true);
++  nowUs += 10000;
++  sample();
++  edge(false);
++  assert(gpio.powerWakeRequest() == Request::Verified);
++  gpio.endPowerWakeCapture();
++
++  serviceResult = 9;
++  assert(!gpio.beginPowerWakeCapture() && !handler);
++  serviceResult = 0;
++  edgeResult = 9;
++  assert(!gpio.beginPowerWakeCapture() && !handler);
++  edgeResult = 0;
++  attachResult = 9;
++  const int before = disables;
++  assert(!gpio.beginPowerWakeCapture() && !handler && disables == before + 1);
++  assert(gpio.powerWakeRequest() == Request::None);
++  attachResult = 0;
++  startTimerFails = true;
++  assert(!gpio.beginPowerWakeCapture() && !handler && !timer->active);
++  startTimerFails = false;
++  assert(gpio.beginPowerWakeCapture());
++  stopTimerFails = true;
++  gpio.endPowerWakeCapture();
++  sample();  // A full command queue can leave a callback pending after cleanup.
++  assert(!handler && gpio.powerWakeRequest() == Request::None);
++  stopTimerFails = false;
++  gpio.endPowerWakeCapture();
++  BoardConfig::ACTIVE.input.power = -1;
++  assert(!gpio.beginPowerWakeCapture() && !handler);
++  std::puts("Production capture: both polarities, released/held presses, stability, wrap, cleanup and failures passed");
++}
+diff --git a/test/timed_power_wake/FlowTest.cpp b/test/timed_power_wake/FlowTest.cpp
+new file mode 100644
+index 00000000..dea24358
+--- /dev/null
++++ b/test/timed_power_wake/FlowTest.cpp
+@@ -0,0 +1,167 @@
++#include <cassert>
++#include <cstdint>
++#include <cstdio>
++#include <initializer_list>
++
++#define RTC_NOINIT_ATTR
++#define LOG_DBG(...)
++constexpr int ESP_RST_SW = 3;
++static int resetReason = ESP_RST_SW;
++static uint32_t clockMs = 0;
++static int renders = 0, sleeps = 0;
++static uint64_t configured = 60000000, sleptInterval = 0;
++static bool timerPowerCaptureReady = true, isSilentReboot = false, rebootedFromPanic = false;
++enum class Phase { None, BeforeRender, DuringRender, DisplaySleep, StorageSleep, InSleep };
++static Phase phase = Phase::None;
++struct Slept {};
++struct Restarted {};
++struct HalGPIO {
++  static constexpr uint32_t POWER_WAKE_STABILITY_MS = 10;
++  enum class WakeupReason { Timer, PowerButton };
++  enum class PowerWakeRequest { None, Pressed, Verified };
++  PowerWakeRequest request = PowerWakeRequest::None;
++  int captureEnds = 0;
++  PowerWakeRequest powerWakeRequest() { return request; }
++  void endPowerWakeCapture() { ++captureEnds; }
++} gpio;
++static void inject(Phase at) {
++  if (phase == at) gpio.request = HalGPIO::PowerWakeRequest::Verified;
++}
++uint32_t millis() { return clockMs; }
++void delay(unsigned ms) { clockMs += ms; }
++int esp_reset_reason() { return resetReason; }
++struct FakeESP {
++  [[noreturn]] void restart() { throw Restarted{}; }
++};
++[[maybe_unused]] FakeESP ESP;
++struct CrossPointSettings {
++  enum class SHORT_PWRBTN { IGNORE, SLEEP };
++  SHORT_PWRBTN shortPwrBtn = SHORT_PWRBTN::IGNORE;
++} SETTINGS;
++static bool wakePowerReleasePending = false;
++struct {
++  void deepSleep() { inject(Phase::DisplaySleep); }
++  void setInverted(bool) {}
++} display;
++struct {
++  void deepSleep() {}
++} halTiltSensor;
++struct {
++  void prepareForDeepSleep() { inject(Phase::StorageSleep); }
++} Storage;
++struct {
++  void startDeepSleep(HalGPIO&, uint64_t interval = 0, bool fromTimer = false) {
++    inject(Phase::InSleep);
++    if (fromTimer && gpio.request != HalGPIO::PowerWakeRequest::None) return;
++    ++sleeps;
++    sleptInterval = interval;
++    throw Slept{};
++  }
++} powerManager;
++int renderer = 0, mappedInputManager = 0;
++void setupDisplayAndFonts(bool) { inject(Phase::BeforeRender); }
++uint64_t timedSleepScreenRefreshUs() { return configured; }
++struct SleepActivity {
++  SleepActivity(int, int) {}
++  bool renderTimedSleepScreen() {
++    ++renders;
++    inject(Phase::DuringRender);
++    return true;
++  }
++};
++
++#include "HandoffSource.inc"
++
++static bool runTimer() {
++  try {
++    switch (HalGPIO::WakeupReason::Timer) {
++#include "TimerCase.inc"
++      case HalGPIO::WakeupReason::PowerButton:
++        break;
++    }
++  } catch (const Restarted&) {
++    return true;
++  } catch (const Slept&) {
++    return false;
++  }
++  assert(false);
++  return false;
++}
++
++[[maybe_unused]] static bool runPowerResume(HalGPIO::PowerWakeRequest request, bool wakeHoldVerified) {
++  [[maybe_unused]] const auto resumedTimerPower = request;
++  try {
++    switch (HalGPIO::WakeupReason::PowerButton) {
++#include "PowerCase.inc"
++      case HalGPIO::WakeupReason::Timer:
++        break;
++    }
++  } catch (const Slept&) {
++    return false;
++  }
++  return wakePowerReleasePending;
++}
++
++static void reset(Phase at = Phase::None) {
++  phase = at;
++  gpio.request = HalGPIO::PowerWakeRequest::None;
++  gpio.captureEnds = renders = sleeps = 0;
++  configured = 60000000;
++  timerPowerCaptureReady = true;
++  isSilentReboot = rebootedFromPanic = false;
++  clockMs = 0;
++  wakePowerReleasePending = false;
++  SETTINGS.shortPwrBtn = CrossPointSettings::SHORT_PWRBTN::IGNORE;
++}
++
++int main(int argc, char**) {
++  reset(Phase::DuringRender);
++  const bool resumed = runTimer();
++  if (argc > 1) return resumed ? 0 : 42;
++  assert(resumed && sleeps == 0 && renders == 1);
++#if HAS_HANDOFF
++  assert(consumeTimedPowerWake() == HalGPIO::PowerWakeRequest::Verified);
++  assert(consumeTimedPowerWake() == HalGPIO::PowerWakeRequest::None);
++  for (const auto at :
++       {Phase::BeforeRender, Phase::DuringRender, Phase::DisplaySleep, Phase::StorageSleep, Phase::InSleep}) {
++    reset(at);
++    assert(runTimer() && sleeps == 0 && gpio.captureEnds == 1);
++    assert(consumeTimedPowerWake() == HalGPIO::PowerWakeRequest::Verified);
++  }
++  reset();
++  gpio.request = HalGPIO::PowerWakeRequest::Verified;
++  assert(runTimer() && renders == 0);
++  assert(consumeTimedPowerWake() == HalGPIO::PowerWakeRequest::Verified);
++  reset();
++  gpio.request = HalGPIO::PowerWakeRequest::Pressed;
++  assert(runTimer() && renders == 0 && clockMs == 10);
++  assert(consumeTimedPowerWake() == HalGPIO::PowerWakeRequest::Pressed);
++
++  for (int mode = 0; mode < 4; ++mode) {
++    reset();
++    if (mode == 0) timerPowerCaptureReady = false;
++    if (mode == 1) isSilentReboot = true;
++    if (mode == 2) rebootedFromPanic = true;
++    if (mode == 3) configured = 0;
++    assert(!runTimer() && renders == 0 && sleptInterval == 0);
++  }
++  reset();
++  assert(runPowerResume(HalGPIO::PowerWakeRequest::Verified, true) && sleeps == 0);
++  reset();
++  assert(!runPowerResume(HalGPIO::PowerWakeRequest::Pressed, false) && sleptInterval == configured);
++  reset();
++  SETTINGS.shortPwrBtn = CrossPointSettings::SHORT_PWRBTN::SLEEP;
++  assert(runPowerResume(HalGPIO::PowerWakeRequest::Pressed, false) && sleeps == 0);
++  reset();
++  assert(!runPowerResume(HalGPIO::PowerWakeRequest::None, false) && sleptInterval == 0);
++  for (const uint32_t stamp : {TIMED_POWER_PRESS, TIMED_POWER_VERIFIED, uint32_t{0xffffffff}}) {
++    timedPowerWakeStamp = stamp;
++    resetReason = 1;
++    assert(consumeTimedPowerWake() == HalGPIO::PowerWakeRequest::None && timedPowerWakeStamp == 0);
++  }
++  resetReason = ESP_RST_SW;
++#endif
++  reset();
++  assert(!runTimer() && renders == 1 && sleeps == 1 && sleptInterval == configured);
++  std::puts("Timer Power handoff, sleep boundaries, wake policy, one-shot stamp and disabled cycles passed");
++}
+diff --git a/test/timed_power_wake/run.py b/test/timed_power_wake/run.py
+new file mode 100644
+index 00000000..022bc366
+--- /dev/null
++++ b/test/timed_power_wake/run.py
+@@ -0,0 +1,61 @@
++#!/usr/bin/env python3
++"""Run the production timer branch against controlled input and sleep boundaries."""
++import argparse
++import os
++from pathlib import Path
++import subprocess
++import tempfile
++
++parser = argparse.ArgumentParser(description=__doc__)
++parser.add_argument("--baseline", help="also require the unpatched Git ref to reproduce the lost press")
++parser.add_argument("--expect-regression", action="store_true")
++args = parser.parse_args()
++root = Path(__file__).resolve().parents[2]
++here = Path(__file__).resolve().parent
++
++
++def run(source, name, regression):
++    start = source.index("    case HalGPIO::WakeupReason::Timer: {")
++    end = source.index("    case HalGPIO::WakeupReason::PowerButton:", start)
++    marker = "RTC_NOINIT_ATTR uint32_t timedPowerWakeStamp;"
++    handoff = source[source.index(marker):source.index("void setup() {")] if marker in source else ""
++    with tempfile.TemporaryDirectory(prefix="timed-power-wake-") as temporary:
++        temp = Path(temporary)
++        (temp / "TimerCase.inc").write_text(source[start:end])
++        power_end = source.index("    case HalGPIO::WakeupReason::AfterUSBPower:", end)
++        (temp / "PowerCase.inc").write_text(source[end:power_end])
++        (temp / "HandoffSource.inc").write_text(handoff)
++        executable = temp / "flow"
++        subprocess.run(
++            [os.environ.get("CXX", "c++"), "-std=c++20", "-O0", "-Wall", "-Wextra",
++             "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
++             "-DHAS_HANDOFF=" + str(int(bool(handoff))), "-I", str(temp),
++             str(here / "FlowTest.cpp"), "-o", str(executable)], check=True
++        )
++        result = subprocess.run([str(executable)] + (["negative-control"] if regression else []))
++        expected = 42 if regression else 0
++        if result.returncode != expected:
++            raise RuntimeError(f"{name}: exit {result.returncode}, expected {expected}")
++        print(f"{name}: expected exit {expected}")
++
++
++run((root / "src/main.cpp").read_text(), "candidate", args.expect_regression)
++if args.baseline:
++    original = subprocess.check_output(["git", "show", args.baseline + ":src/main.cpp"], cwd=root, text=True)
++    run(original, "baseline", True)
++
++capture = (root / "lib/hal/HalGPIO.cpp").read_text()
++start = capture.find("void IRAM_ATTR HalGPIO::recordPowerWake(")
++if start >= 0 and not args.expect_regression:
++    end = capture.index("bool HalGPIO::verifyPowerButtonWakeup()", start)
++    with tempfile.TemporaryDirectory(prefix="timed-power-capture-") as temporary:
++        temp = Path(temporary)
++        (temp / "CaptureSource.inc").write_text(capture[start:end])
++        executable = temp / "capture"
++        subprocess.run(
++            [os.environ.get("CXX", "c++"), "-std=c++20", "-O0", "-Wall", "-Wextra",
++             "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-I", str(temp),
++             "-I", str(here / "stubs"), "-I", str(root / "lib/hal"),
++             str(here / "CaptureTest.cpp"), "-o", str(executable)], check=True
++        )
++        subprocess.run([str(executable)], check=True)
+diff --git a/test/timed_power_wake/stubs/Arduino.h b/test/timed_power_wake/stubs/Arduino.h
+new file mode 100644
+index 00000000..4a040254
+--- /dev/null
++++ b/test/timed_power_wake/stubs/Arduino.h
+@@ -0,0 +1,15 @@
++#pragma once
++#include <cstdint>
++#define IRAM_ATTR
++#define LOW 0
++#define HIGH 1
++struct portMUX_TYPE {
++  int depth = 0;
++};
++#define portMUX_INITIALIZER_UNLOCKED \
++  {                                  \
++  }
++#define portENTER_CRITICAL(mux) (++(mux)->depth)
++#define portEXIT_CRITICAL(mux) (--(mux)->depth)
++#define portENTER_CRITICAL_ISR(mux) portENTER_CRITICAL(mux)
++#define portEXIT_CRITICAL_ISR(mux) portEXIT_CRITICAL(mux)
+diff --git a/test/timed_power_wake/stubs/InputManager.h b/test/timed_power_wake/stubs/InputManager.h
+new file mode 100644
+index 00000000..52355cd3
+--- /dev/null
++++ b/test/timed_power_wake/stubs/InputManager.h
+@@ -0,0 +1,2 @@
++#pragma once
++class InputManager {};
+diff --git a/test/timed_power_wake/stubs/freertos/timers.h b/test/timed_power_wake/stubs/freertos/timers.h
+new file mode 100644
+index 00000000..d106ca91
+--- /dev/null
++++ b/test/timed_power_wake/stubs/freertos/timers.h
+@@ -0,0 +1,17 @@
++#pragma once
++#include <cstdint>
++using TickType_t = uint32_t;
++constexpr int pdTRUE = 1, pdPASS = 1;
++#define pdMS_TO_TICKS(ms) (ms)
++struct StaticTimer_t;
++using TimerHandle_t = StaticTimer_t*;
++using TimerCallbackFunction_t = void (*)(TimerHandle_t);
++struct StaticTimer_t {
++  void* id = nullptr;
++  TimerCallbackFunction_t callback = nullptr;
++  bool active = false;
++};
++TimerHandle_t xTimerCreateStatic(const char*, TickType_t, int, void*, TimerCallbackFunction_t, StaticTimer_t*);
++int xTimerStart(TimerHandle_t, TickType_t);
++int xTimerStop(TimerHandle_t, TickType_t);
++void* pvTimerGetTimerID(TimerHandle_t);
+diff --git a/test/timer_wake_arm/TimerWakeArmTest.cpp b/test/timer_wake_arm/TimerWakeArmTest.cpp
+index 9065e833..978acce0 100644
+--- a/test/timer_wake_arm/TimerWakeArmTest.cpp
++++ b/test/timer_wake_arm/TimerWakeArmTest.cpp
+@@ -8,7 +8,8 @@
+ #define ENABLE_SERIAL_LOG
+ constexpr int ESP_OK = 0, ESP_ERR_INVALID_STATE = 1, ESP_ERR_INVALID_ARG = 2;
+ constexpr int ESP_SLEEP_WAKEUP_TIMER = 4, GPIO_NUM_13 = 13;
+-constexpr int GPIO_MODE_OUTPUT = 1, OUTPUT = 1, LOW = 0, HIGH = 1;
++[[maybe_unused]] constexpr int GPIO_MODE_OUTPUT = 1;
++constexpr int OUTPUT = 1, LOW = 0, HIGH = 1;
+ using gpio_num_t = int;
+ static constexpr gpio_num_t XTEINK_C3_GPIO13 = GPIO_NUM_13;
+ static int armResult = ESP_OK, clearResult = ESP_OK, armCalls = 0, clearCalls = 0, latchWrites = 0;
+@@ -50,10 +51,17 @@ struct Serial {
+   }
+ } logSerial;
+ struct HalGPIO {
++  enum class PowerWakeRequest { None, Verified };
++  static inline PowerWakeRequest request = PowerWakeRequest::None;
++  PowerWakeRequest powerWakeRequest() const { return request; }
+   bool isXteinkDevice() const { return true; }
+ };
+ struct HalPowerManager {
++#if HAS_TIMED_POWER
++  void startDeepSleep(HalGPIO&, uint64_t = 0, bool = false) const;
++#else
+   void startDeepSleep(HalGPIO&, uint64_t = 0) const;
++#endif
+ };
+ namespace BoardConfig {
+ enum class Board { XteinkX4, XteinkX3, XteinkX3Uc8279 };
+@@ -75,9 +83,12 @@ void gpio_hold_en(gpio_num_t) {}
+ void pinMode(int, int) {}
+ void digitalWrite(int, int) {}
+ namespace freeink {
++static bool pressDuringTeardown = false;
++static bool pressDuringArm = false;
+ struct PowerManager {
+   static void powerDownRailsForSleep() {
+     trace.push_back("rails-down");
++    if (pressDuringTeardown) HalGPIO::request = HalGPIO::PowerWakeRequest::Verified;
+     if (BoardConfig::ACTIVE.board == BoardConfig::Board::XteinkX3 ||
+         BoardConfig::ACTIVE.board == BoardConfig::Board::XteinkX3Uc8279) {
+       // Model the production X3 SD-rail shutdown so the test proves the HAL
+@@ -85,6 +96,14 @@ struct PowerManager {
+       latchLevel = LOW;
+     }
+   }
++  static void armPowerButtonWakeup() {
++    trace.push_back("power-arm");
++    if (pressDuringArm) HalGPIO::request = HalGPIO::PowerWakeRequest::Verified;
++  }
++  [[noreturn]] static void deepSleep() {
++    trace.push_back("direct-sleep");
++    throw Slept{};
++  }
+   [[noreturn]] static void deepSleepUntilPowerButton() {
+     trace.push_back("sleep");
+     throw Slept{};
+@@ -101,6 +120,9 @@ static void reset() {
+   BoardConfig::ACTIVE.board = BoardConfig::Board::XteinkX4;
+   errors.clear();
+   trace.clear();
++  HalGPIO::request = HalGPIO::PowerWakeRequest::None;
++  freeink::pressDuringTeardown = false;
++  freeink::pressDuringArm = false;
+ }
+ static bool sleep(uint64_t interval) {
+   HalGPIO gpio;
+@@ -122,8 +144,9 @@ static bool rejectedRequest() {
+ int main(int argc, char**) {
+   if (argc > 1) return rejectedRequest() ? 0 : 42;
+   reset();
+-  assert(sleep(0) && armCalls == 0 && clearCalls == 0 && errors.empty());
+-  assert(trace == std::vector<std::string>({"serial-end", "rails-down", "sleep"}));
++  timerArmed = true;
++  assert(sleep(0) && armCalls == 0 && clearCalls == 1 && !timerArmed && errors.empty());
++  assert(trace == std::vector<std::string>({"clear", "serial-end", "rails-down", "sleep"}));
+   assert(latchWrites == (SOC_PM_SUPPORT_EXT1_WAKEUP ? 0 : 1));
+   assert(SOC_PM_SUPPORT_EXT1_WAKEUP || latchLevel == LOW);
+   reset();
+@@ -138,7 +161,7 @@ int main(int argc, char**) {
+   assert(SOC_PM_SUPPORT_EXT1_WAKEUP || latchLevel == HIGH);
+   reset();
+   BoardConfig::ACTIVE.board = BoardConfig::Board::XteinkX3;
+-  assert(sleep(0) && !timerArmed && armCalls == 0 && clearCalls == 0 && errors.empty());
++  assert(sleep(0) && !timerArmed && armCalls == 0 && clearCalls == 1 && errors.empty());
+   assert(latchWrites == (SOC_PM_SUPPORT_EXT1_WAKEUP ? 0 : 1));
+   assert(SOC_PM_SUPPORT_EXT1_WAKEUP || latchLevel == LOW);
+   reset();
+@@ -169,5 +192,27 @@ int main(int argc, char**) {
+   }
+   assert(errors == std::vector<int>({ESP_ERR_INVALID_ARG, 9}));
+   assert(!serialEnded && latchWrites == 0 && trace.back() == "restart");
+-  std::cout << "Timer arm failure/cleanup, C3 latch, and EXT1 paths passed\n";
++#if HAS_TIMED_POWER
++  reset();
++  HalGPIO gpio;
++  HalGPIO::request = HalGPIO::PowerWakeRequest::Verified;
++  HalPowerManager{}.startDeepSleep(gpio, 60000000, true);
++  assert(trace.empty());
++  reset();
++  freeink::pressDuringTeardown = true;
++  HalPowerManager{}.startDeepSleep(gpio, 60000000, true);
++  assert(trace.back() == "rails-down");
++  reset();
++  freeink::pressDuringArm = true;
++  HalPowerManager{}.startDeepSleep(gpio, 60000000, true);
++  assert(trace.back() == "power-arm");
++  reset();
++  try {
++    HalPowerManager{}.startDeepSleep(gpio, 60000000, true);
++    assert(false);
++  } catch (const Slept&) {
++  }
++  assert(trace[trace.size() - 2] == "power-arm" && trace.back() == "direct-sleep");
++#endif
++  std::cout << "Timer arm/zero cleanup, C3 rails, Power teardown and EXT1 paths passed\n";
+ }
+diff --git a/test/timer_wake_arm/run.py b/test/timer_wake_arm/run.py
+index 14977574..55e03d3c 100644
+--- a/test/timer_wake_arm/run.py
++++ b/test/timer_wake_arm/run.py
+@@ -36,6 +36,7 @@ with tempfile.TemporaryDirectory(prefix="timer-wake-arm-") as temporary:
+             subprocess.run(
+                 [os.environ.get("CXX", "c++"), "-std=c++20", "-O0", "-Wall", "-Wextra",
+                  "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
++                 "-DHAS_TIMED_POWER=" + str(int("bool fromTimerWake" in function(source))),
+                  "-DSOC_PM_SUPPORT_EXT1_WAKEUP=" + str(ext1), "-I", str(temp),
+                  str(here / "TimerWakeArmTest.cpp"), "-o", str(executable)], check=True
+             )
