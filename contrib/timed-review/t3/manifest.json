@@ -1,0 +1,21 @@
+{
+  "classification": "DEPENDENT_REVIEW",
+  "cpBase": "7a76e1244b758acf5f1ced41cea9ecffdbd4ac44",
+  "develop": "089e7ae5f9bebc96973b07802815a81cf4715bbe",
+  "sdkBase": "084fdfb24b16e890844ca5cb44951694ba8d6c56",
+  "trees": {
+    "base": "68f996f1f65a8c21a2ef59ddabe0dda46409a4c2",
+    "prerequisites": "c1e0d2db16e2bf59bc42c7e6ef5bdd88bb312634",
+    "w06": "ae4d8be212c3bfb60ad20152ca43042d7cae3e0a",
+    "timed": "4acd57fc94f3f848eae1052a1d5946b51e65cc9f"
+  },
+  "patches": {
+    "01-checked-bmp.patch": "a12e071e4689b3f42e3c865498d275acf6d2a1b9701bb5270412133dde45bab3",
+    "02-bounded-events.patch": "080a05952b8c5e747c84da22ee0a78be91fe91e5c3045e82b5a65d363de80d4d",
+    "03-verified-events.patch": "b15ee47d2bc4cca356c780f26e696ef776c3e40b2df3c63157c5ceb0dd1675ff",
+    "04-timed-source.patch": "55ee3ce2d60974c511fc97bab5e6cf0f4da263d95372c5c9cbd9db9706328736",
+    "sdk-verified.patch": "f6d5cb9f46bc4aac8aeaacdbd376889c871bec2545a9ab5e814efd1fc0ed9997"
+  },
+  "privateHelperIncluded": false,
+  "firmwareIncluded": false
+}

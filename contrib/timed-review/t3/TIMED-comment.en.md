@@ -1,0 +1,5 @@
+This integration puts the Local wallpaper path and one SD-plugin consumer behind a single Off/Local/Plugin choice. One caller owns preparation, Power takeover, panel work, rearming and sleep. A failed online attempt keeps the last-good image rather than switching to an unrelated local wallpaper.
+
+The aim is to keep the reader a reader while letting it show current information when it is set down. A shared timer path should make that possible for SD-installed plugins without asking users to maintain a separate firmware fork.
+
+The series preserves the timer work from #3820, jadehawk's Local consumer and the SDK RTC work. It also fixes an integration issue found in review: early Local refresh must not save reader state before that state has been loaded. An explicitly selected source now also keeps its timer when a board returns to sleep after a USB-powered cold boot. The packet includes the regression and separates W06 from TIMED. The source-selection contract and SDK API remain proposals; build and device results are scoped in the notes. Code and tests were developed with AI assistance.

@@ -1,3 +1,21 @@
+# Verified downloads and timed sleep-screen integration
+
+Updated 18 October 2026. The [T3 review package](t3/README.md) separates verified
+event downloads (W06) from the shared Off/Local/Plugin timer consumer. It includes
+pinned public prerequisites, replay commands and [validation notes](t3/NOTES.en.md).
+
+- [Download the T3 source package](t3/t3-support.zip).
+- Replay W06 alone with `--through w06`, or the whole integration with the default.
+- The recorded neutral Sticky image passed online/Local/Off cases, physical
+  Power during a paced response and two functional battery cycles.
+
+CP `7a76e124` and SDK `084fdfb2` are the tested bases. Accepted SDK/source-selection
+contracts and compatible upstream refs are still needed for separate CP PRs.
+The current timer PR remains independently reviewable. No firmware is distributed here.
+
+<details>
+<summary>Previous review packages and device notes</summary>
+
 # SD-configured timer image consumer
 
 Updated 12 October 2026. The complete consumer is available in the
@@ -34,3 +52,5 @@ The SDK RTC/PMIC changes from that snapshot are already in the current SDK base.
 
 The [standalone PaperMono timer adapter](../papermono-timer-adapter/README.md)
 remains separate support for PR #3820; this update leaves those files unchanged.
+
+</details>
