@@ -1,0 +1,807 @@
+--- /dev/null
++++ b/docs/papermono-timer.md
+@@ -0,0 +1,58 @@
++# PaperMono timer wake
++
++This ports the existing PaperMono adapter to Razor-Crest timedwake-r1 plus the
++Power handoff patch. The pinned SDK `7fcd3b34` already includes PR #138; no SDK
++revision or RTC driver is changed.
++The timer primitive remains Michael Kazakov's work; the board adapter is extracted
++from the previously shared PaperMono support material.
++
++`startDeepSleep(gpio, intervalUs)` uses RX8130 and PMIC GPIO0 on PaperMono. The
++ESP loses power during PMIC shutdown, so the ESP timer cannot provide this wake.
++Use whole seconds: 1 through 3,932,100 seconds. The SDK counts intervals above
++65,535 seconds in minutes, rounded up. Zero clears the RTC timer and its PMIC
++route before ordinary button-only shutdown. Invalid intervals or an arm failure
++fall back to button-only shutdown only after successful cancellation. If the
++route cannot be cleared, firmware restarts instead of shutting down with unknown
++wake state. A returned PMIC shutdown also cancels the timer and restarts; it must
++not fall through into ESP-only sleep without a usable Power-button wake source.
++
++The first wake query consumes the RTC flag and clears the route. It reports
++`Timer` only when RTC timer state and the PMIC's exclusive GPIO0 wake source agree,
++with a cold power-on reset and no ESP wake cause. Button/USB flags, another wake
++input, invalid RTC state, I2C failure, and software/watchdog resets do not establish
++a board RTC wake. The RTC wake result is cached for that boot; subsequent queries do not read or
++clear the RTC again.
++
++The existing local Custom sleep-screen refresh is now available on PaperMono.
++The default remains Off. This adds no network request or second timer consumer.
++During maintenance, the HAL reads the PMIC's held/read-clear event bits. A click
++released during blocking panel I/O is retained until the next check. There is no
++GPIO interrupt or periodic sampler for this board. PMIC read failure leaves the
++maintenance path; capture setup failure prevents periodic refresh.
++
++Power checked before shutdown, including the SDK pre-command settle callback,
++cancels the RTC route and returns to the ordinary
++reader through the existing software handoff. A returned shutdown on USB also
++cancels the route and restarts instead of entering unusable ESP-only sleep. A
++Power event read after returned shutdown uses the same handoff. The final PMIC
++power-cut transition still needs physical timing checks; host tests cannot
++establish that every possible pulse is retained there.
++
++## Verification
++
++```sh
++python3 test/papermono_timer/run.py
++python3 test/timer_wake_arm/run.py
++```
++
++The PaperMono tests compile the real adapter and RTC driver against the SDK's
++recording I2C bus. Reset/wake values and PMIC power removal are simulated. The
++sleep-path tests use the production function with controlled API results. Neither
++is evidence of physical power removal, battery runtime or button behavior. A new
++PaperMono binary requires its own device check before claiming those results.
++
++For device acceptance, check one-minute local rotation on battery, a real Power
++click during panel work returning to the same book, Off after an armed cycle,
++and the returned-shutdown path on USB when reachable. Keep brownout detection
++enabled. Record the firmware hash and scoped results with the contribution;
++earlier adapter results do not qualify a new binary.
+--- a/docs/timed-wake-testing.md
++++ b/docs/timed-wake-testing.md
+@@ -72,6 +72,10 @@
+ 
+ ## Baseline validation status
+ 
++The [PaperMono candidate](papermono-timer.md) enables this existing local refresh
++with RTC/PMIC wake and Power handoff. Build and device evidence must identify
++the exact candidate; the r1 observations below remain historical.
++
+ The observations below belong to timedwake-r1 (`5955536`). They do not qualify
+ the later Power handoff; repeat the relevant device checks on the actual candidate.
+ 
+--- a/lib/hal/HalGPIO.cpp
++++ b/lib/hal/HalGPIO.cpp
+@@ -10,6 +10,10 @@
+ #include <esp_timer.h>
+ #include <hal/gpio_ll.h>
+ 
++#if FREEINK_DEVICE_PAPERMONO
++#include "PaperMonoTimer.h"
++#endif
++
+ // Global HalGPIO instance
+ HalGPIO gpio;
+ 
+@@ -229,6 +233,18 @@
+ 
+ bool HalGPIO::beginPowerWakeCapture() {
+   endPowerWakeCapture();
++#if FREEINK_DEVICE_PAPERMONO
++  uint8_t status = 0;
++  if (!freeink::papermono::ensureBooted() || !freeink::m5pm1::readButtonStatus(&status)) {
++    LOG_ERR("GPIO", "PMIC Power capture unavailable");
++    return false;
++  }
++  powerCapturePmic = true;
++  // PaperMono accepts the PMIC click; it has no GPIO hold-verification policy.
++  if (status & (freeink::m5pm1::BTN_EVENT | freeink::m5pm1::BTN_PRESSED))
++    powerCaptureRequest = PowerWakeRequest::Verified;
++  return true;
++#endif
+   const int8_t pin = BoardConfig::ACTIVE.input.power;
+   if (pin < 0) return false;
+   if (!powerVerifyTimer) {
+@@ -270,6 +286,20 @@
+ }
+ 
+ HalGPIO::PowerWakeRequest HalGPIO::powerWakeRequest() {
++#if FREEINK_DEVICE_PAPERMONO
++  if (powerCapturePmic) {
++    if (powerCaptureRequest != PowerWakeRequest::None) return powerCaptureRequest;
++    uint8_t status = 0;
++    if (!freeink::m5pm1::readButtonStatus(&status)) {
++      LOG_ERR("GPIO", "PMIC Power read failed; leaving timer operation");
++      powerCaptureRequest = PowerWakeRequest::Verified;
++    } else if (status & (freeink::m5pm1::BTN_EVENT | freeink::m5pm1::BTN_PRESSED)) {
++      // The read-clear event survives a released click during blocking I/O.
++      powerCaptureRequest = PowerWakeRequest::Verified;
++    }
++    return powerCaptureRequest;
++  }
++#endif
+   portENTER_CRITICAL(&powerCaptureMux);
+   if (powerCapturePin >= 0) {
+     recordPowerWake(gpio_ll_get_level(&GPIO, powerCapturePin) == powerCaptureLevel,
+@@ -281,6 +311,9 @@
+ }
+ 
+ void HalGPIO::endPowerWakeCapture() {
++#if FREEINK_DEVICE_PAPERMONO
++  powerCapturePmic = false;
++#endif
+   // A queued callback is harmless after the pin is cleared; storage lives with gpio.
+   if (powerVerifyTimer) xTimerStop(powerVerifyTimer, 0);
+   if (powerCapturePin >= 0) {
+@@ -352,6 +385,19 @@
+ static_assert(ESP_RST_DEEPSLEEP == wakeup::RST_DEEPSLEEP, "reset-reason values drifted from WakeupClassify.h");
+ 
+ HalGPIO::WakeupReason HalGPIO::getWakeupReason() const {
++#if FREEINK_DEVICE_PAPERMONO
++  static const bool rtcTimerWake = [] {
++    bool fired = false;
++    if (!papermonotimer::takeWake(fired)) {
++      LOG_ERR("GPIO", "RTC wake state unavailable or cleanup failed");
++      return false;
++    }
++    return fired;
++  }();
++  if (rtcTimerWake && esp_reset_reason() == ESP_RST_POWERON &&
++      esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_UNDEFINED)
++    return WakeupReason::Timer;
++#endif
+   return wakeup::classify(esp_sleep_get_wakeup_cause(), esp_reset_reason(), isUsbConnected(),
+                           coldBootImpliesPowerButton());
+ }
+--- a/lib/hal/HalGPIO.h
++++ b/lib/hal/HalGPIO.h
+@@ -60,6 +60,9 @@
+   uint8_t powerCaptureLevel = 0;
+   PowerWakeRequest powerCaptureRequest = PowerWakeRequest::None;
+   bool powerCaptureDown = false;
++#if FREEINK_DEVICE_PAPERMONO
++  bool powerCapturePmic = false;
++#endif
+   uint32_t powerCaptureStartUs = 0;
+   StaticTimer_t powerVerifyStorage{};
+   TimerHandle_t powerVerifyTimer = nullptr;
+--- a/lib/hal/HalPowerManager.cpp
++++ b/lib/hal/HalPowerManager.cpp
+@@ -18,6 +18,8 @@
+ 
+ #if FREEINK_DEVICE_PAPERMONO
+ #include <M5Pm1.h>
++
++#include "PaperMonoTimer.h"
+ #endif
+ 
+ HalPowerManager powerManager;  // Singleton instance
+@@ -77,6 +79,7 @@
+ 
+ void HalPowerManager::startDeepSleep(HalGPIO& gpio, uint64_t timerWakeUs, bool fromTimerWake) const {
+   if (fromTimerWake && gpio.powerWakeRequest() != HalGPIO::PowerWakeRequest::None) return;
++#if !FREEINK_DEVICE_PAPERMONO
+   const auto clearTimer = [] {
+     const auto disabled = esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+     if (disabled != ESP_OK && disabled != ESP_ERR_INVALID_STATE) {
+@@ -96,6 +99,7 @@
+   } else {
+     clearTimer();
+   }
++#endif
+ #if FREEINK_DEVICE_EEGO_A4
+   // LM3630A and GSL share I2C; turn the light off before touch releases the bus.
+   Frontlight.setOn(false);
+@@ -171,12 +175,31 @@
+ #endif
+ 
+ #if FREEINK_DEVICE_PAPERMONO
+-  // Its power button is behind the M5PM1 PMIC rather than an ESP GPIO, so
+-  // normal GPIO deep sleep would have no wake source. Ask the PMIC to shut the
+-  // device down; a button click then restarts it through a cold boot.
+-  if (freeink::m5pm1::requestShutdown()) {
+-    delay(1000);  // allow the PMIC firmware time to drop power
+-  }
++  if (!papermonotimer::arm(timerWakeUs)) {
++    LOG_ERR("PWR", "RTC arming failed; requesting button-only sleep");
++    if (!papermonotimer::cancel()) {
++      LOG_ERR("PWR", "RTC state unknown; restarting without shutdown");
++      esp_restart();
++      return;
++    }
++  }
++  if (fromTimerWake && gpio.powerWakeRequest() != HalGPIO::PowerWakeRequest::None) {
++    if (!papermonotimer::cancel()) LOG_ERR("PWR", "RTC cleanup failed during Power handoff");
++    return;
++  }
++  bool (*shouldAbort)(void*) = nullptr;
++  if (fromTimerWake) {
++    shouldAbort = [](void* context) {
++      return static_cast<HalGPIO*>(context)->powerWakeRequest() != HalGPIO::PowerWakeRequest::None;
++    };
++  }
++  if (freeink::m5pm1::requestShutdown(shouldAbort, &gpio)) delay(1000);
++  if (!papermonotimer::cancel()) LOG_ERR("PWR", "RTC cleanup failed after returned shutdown");
++  if (fromTimerWake && gpio.powerWakeRequest() != HalGPIO::PowerWakeRequest::None) return;
++  // ESP-only sleep has no PaperMono Power-button wake source.
++  LOG_ERR("PWR", "PMIC shutdown returned; restarting to restore the reader");
++  esp_restart();
++  return;
+ #endif
+ #if FREEINK_DEVICE_METALIO_EINK4
+   // Deep sleep leaves the board, 4G modem and audio module powered, so cut
+--- a/lib/hal/HalPowerManager.h
++++ b/lib/hal/HalPowerManager.h
+@@ -40,8 +40,8 @@
+ 
+   // Setup wake up GPIO and enter deep sleep
+   // Should be called inside main loop() to handle the currentLockMode
+-  // timerWakeUs requests an ESP-IDF one-shot timer in microseconds; zero adds
+-  // no timer. Existing button-wake behavior remains the default.
++  // timerWakeUs requests a one-shot timer; zero cancels the timer route.
++  // PaperMono uses RTC/PMIC whole seconds; other boards use the ESP-IDF timer.
+   void startDeepSleep(HalGPIO& gpio, uint64_t timerWakeUs = 0, bool fromTimerWake = false) const;
+ 
+   // Get battery percentage (range 0-100)
+--- /dev/null
++++ b/lib/hal/PaperMonoTimer.h
+@@ -0,0 +1,42 @@
++#pragma once
++
++#include <PaperMonoBoard.h>
++#include <Rtc.h>
++
++namespace papermonotimer {
++inline bool cancel() {
++  freeink::Rtc rtc;
++  const bool stopped = rtc.begin() && rtc.cancelWakeTimer();
++  const bool disabled = freeink::papermono::setRtcWake(false);
++  return stopped && disabled;
++}
++
++inline bool takeWake(bool& timerWake) {
++  timerWake = false;
++  if (!freeink::papermono::ensureBooted()) return false;
++  const auto wake = freeink::papermono::bootWakeState();
++  freeink::Rtc rtc;
++  bool fired = false;
++  const bool read = rtc.begin() && rtc.readWakeTimer(fired);
++  const bool stopped = rtc.present() && rtc.cancelWakeTimer();
++  const bool disabled = freeink::papermono::setRtcWake(false);
++  if (!read || !stopped || !disabled || !wake.valid) return false;
++  // Exclude a button/USB/reset flag or another enabled PMIC wake input.
++  timerWake = fired && wake.source == freeink::m5pm1::WAKE_EXTERNAL &&
++              (wake.enabledPins & freeink::m5pm1::GPIO_WAKE_MASK) == freeink::m5pm1::GPIO0;
++  return true;
++}
++
++inline bool arm(uint64_t intervalUs) {
++  if (!cancel()) return false;
++  if (!intervalUs) return true;
++  if (intervalUs % 1000000ULL || intervalUs / 1000000ULL > UINT32_MAX) return false;
++  freeink::Rtc rtc;
++  if (!rtc.begin() || !freeink::papermono::setRtcWake(true) ||
++      !rtc.armWakeTimer(static_cast<uint32_t>(intervalUs / 1000000ULL))) {
++    cancel();
++    return false;
++  }
++  return true;
++}
++}  // namespace papermonotimer
+--- a/lib/hal/WakeupClassify.h
++++ b/lib/hal/WakeupClassify.h
+@@ -12,7 +12,7 @@
+ enum class Reason : uint8_t {
+   PowerButton,    // Deep-sleep GPIO/ext1 wake (the power button), or a button-
+                   // implied cold boot on button-latched boards
+-  Timer,          // Deep-sleep wake armed through the sleep timer
++  Timer,          // ESP deep-sleep timer or a qualified board RTC wake
+   AfterFlash,     // Post-flash warm boot over USB
+   AfterUSBPower,  // Cold boot on USB power
+   Other           // Undefined causes, panics, watchdogs, brownouts
+--- a/src/CrossPointSettings.h
++++ b/src/CrossPointSettings.h
+@@ -417,7 +417,7 @@
+     return (shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::SLEEP) ? 10 : 400;
+   }
+   uint64_t getTimedSleepScreenRefreshUs() const {
+-#if FREEINK_DEVICE_PAPERMONO || FREEINK_DEVICE_METALIO_EINK4
++#if FREEINK_DEVICE_METALIO_EINK4
+     return 0;
+ #else
+     static constexpr uint32_t SECONDS[] = {0,           60,          15 * 60,      30 * 60,     60 * 60,
+--- a/src/SettingsList.h
++++ b/src/SettingsList.h
+@@ -292,7 +292,7 @@
+         // --- Display ---
+         SettingInfo::Enum(StrId::STR_SLEEP_SCREEN, &CrossPointSettings::sleepScreen, std::move(sleepScreenValues),
+                           "sleepScreen", StrId::STR_CAT_DISPLAY),
+-#if !FREEINK_DEVICE_PAPERMONO && !FREEINK_DEVICE_METALIO_EINK4
++#if !FREEINK_DEVICE_METALIO_EINK4
+         SettingInfo::Enum(
+             StrId::STR_TIMED_SLEEP_SCREEN_REFRESH, &CrossPointSettings::timedSleepScreenRefresh,
+             {StrId::STR_STATE_OFF, StrId::STR_1_MINUTE, StrId::STR_15_MINUTES, StrId::STR_30_MINUTES, StrId::STR_1_HOUR,
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -495,8 +495,10 @@
+   powerManager.begin();
+ 
+   const auto resumedTimerPower = consumeTimedPowerWake();
+-  const auto wakeupReason = resumedTimerPower != HalGPIO::PowerWakeRequest::None ? HalGPIO::WakeupReason::PowerButton
+-                                                                                 : gpio.getWakeupReason();
++  // Consume board wake state even after a Power handoff, clearing any RTC route.
++  const auto detectedWakeupReason = gpio.getWakeupReason();
++  const auto wakeupReason =
++      resumedTimerPower != HalGPIO::PowerWakeRequest::None ? HalGPIO::WakeupReason::PowerButton : detectedWakeupReason;
+   const bool timerPowerCaptureReady = wakeupReason != HalGPIO::WakeupReason::Timer || gpio.beginPowerWakeCapture();
+   // Sample the wake hold now — a click wake is released within milliseconds of
+   // boot — but defer the sleep-or-boot decision until SETTINGS is loaded below:
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -90,3 +90,5 @@
+ find_package(Python3 REQUIRED COMPONENTS Interpreter)
+ add_test(NAME TrustedTimeTimezone COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_trusted_time.py)
+ add_test(NAME TimerWakeArm COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/timer_wake_arm/run.py)
++
++add_test(NAME PaperMonoTimer COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/papermono_timer/run.py)
+--- /dev/null
++++ b/test/papermono_timer/PaperMonoTimerTest.cpp
+@@ -0,0 +1,71 @@
++#include <PaperMonoTimer.h>
++#include <RecordingRtcBus.h>
++#include <WakeupClassify.h>
++
++#include <cstdlib>
++
++static int resetReason = wakeup::RST_POWERON;
++static int wakeCause = wakeup::WAKEUP_UNDEFINED;
++static bool usb = false;
++[[maybe_unused]] constexpr int ESP_RST_POWERON = wakeup::RST_POWERON;
++[[maybe_unused]] constexpr int ESP_SLEEP_WAKEUP_UNDEFINED = wakeup::WAKEUP_UNDEFINED;
++int esp_reset_reason() { return resetReason; }
++int esp_sleep_get_wakeup_cause() { return wakeCause; }
++#define LOG_ERR(...) ((void)0)
++struct HalGPIO {
++  using WakeupReason = wakeup::Reason;
++  bool isUsbConnected() const { return usb; }
++  bool coldBootImpliesPowerButton() const { return true; }
++  WakeupReason getWakeupReason() const;
++};
++#include "WakeSource.inc"
++
++int main(int argc, char** argv) {
++  assert(argc == 2 || argc == 3);
++  const int mode = std::atoi(argv[1]);
++  reset();
++  regs[0x6E][0x05] = mode == 1 ? 0x24 : mode == 2 ? 0x22 : 0x20;
++  regs[0x6E][0x18] = mode == 3 ? 0x11 : 0x01;
++  regs[0x32][0x1D] = mode == 4 ? 0 : mode == 5 ? 0x12 : 0x10;
++  regs[0x32][0x1C] = 0x12;
++  regs[0x32][0x1E] = 0x10;
++  if (mode == 6) deadBus = true;
++  usb = mode == 2;
++  if (mode >= 7 && mode <= 10) resetReason = mode == 7 ? 3 : mode == 8 ? 9 : mode == 9 ? 5 : 4;
++  if (mode == 11) wakeCause = wakeup::WAKEUP_EXT1;
++  if (mode == 12) regs[0x6E][0x05] = 0;
++  HalGPIO gpio;
++  const auto expected = mode == 0                 ? wakeup::Reason::Timer
++                        : mode == 2               ? wakeup::Reason::AfterUSBPower
++                        : mode >= 7 && mode <= 11 ? wakeup::Reason::Other
++                                                  : wakeup::Reason::PowerButton;
++  const auto actual = gpio.getWakeupReason();
++  if (argc == 3) return actual != expected ? 42 : 0;
++  assert(actual == expected);
++  const int afterFirstQuery = operations;
++  assert(gpio.getWakeupReason() == actual && operations == afterFirstQuery);
++  if (mode == 6) return 0;
++  assert(!(regs[0x32][0x1C] & 0x10) && !(regs[0x32][0x1E] & 0x10));
++  assert(!(regs[0x6E][0x18] & 1));
++  reset();
++  assert(papermonotimer::arm(60000000ULL));
++  assert((regs[0x32][0x1C] & 0x10) && regs[0x6E][0x18] == 1);
++  const int armedOperations = operations;
++  assert(gpio.getWakeupReason() == actual && operations == armedOperations);
++  assert(papermonotimer::arm(0));
++  assert(!(regs[0x32][0x1C] & 0x10) && regs[0x6E][0x18] == 0);
++  assert(!papermonotimer::arm(60000001ULL));
++  assert(papermonotimer::arm(65536ULL * 1000000ULL));
++  assert(regs[0x32][0x1A] == 0x45 && regs[0x32][0x1B] == 0x04);
++  assert(!papermonotimer::arm(3932101ULL * 1000000ULL));
++  assert(!(regs[0x32][0x1C] & 0x10) && !(regs[0x6E][0x18] & 1));
++  regs[0x6E][0x18] = 0x10;
++  regs[0x6E][0x07] = 0x20;
++  assert(!papermonotimer::arm(60000000ULL));
++  assert(regs[0x6E][0x18] == 0x10 && !(regs[0x32][0x1C] & 0x10));
++  assert(regs[0x6E][0x07] == 0x20);
++  reset();
++  dropCounter = true;
++  assert(!papermonotimer::arm(60000000ULL));
++  assert(!(regs[0x32][0x1C] & 0x10) && regs[0x6E][0x18] == 0);
++}
+--- /dev/null
++++ b/test/papermono_timer/PowerCaptureTest.cpp
+@@ -0,0 +1,113 @@
++#include <HalGPIO.h>
++
++#include <cassert>
++#include <cstdio>
++
++#define LOG_ERR(...)
++using gpio_num_t = int;
++constexpr int ESP_OK = 0, ESP_ERR_INVALID_STATE = 1, GPIO_INTR_ANYEDGE = 3;
++static bool bootReady = true, readOk = true;
++static uint8_t buttonStatus = 0;
++static unsigned reads = 0;
++namespace freeink {
++namespace papermono {
++bool ensureBooted() { return bootReady; }
++}  // namespace papermono
++namespace m5pm1 {
++constexpr uint8_t BTN_EVENT = 0x80, BTN_PRESSED = 1;
++bool readButtonStatus(uint8_t* status) {
++  ++reads;
++  if (!readOk) return false;
++  *status = buttonStatus;
++  buttonStatus &= ~BTN_EVENT;
++  return true;
++}
++}  // namespace m5pm1
++}  // namespace freeink
++namespace BoardConfig {
++struct {
++  struct {
++    int8_t power = -1;
++    bool powerActiveHigh = false;
++  } input;
++} ACTIVE;
++}  // namespace BoardConfig
++struct {
++} GPIO;
++int gpio_ll_get_level(decltype(GPIO)*, int) {
++  assert(false);
++  return 0;
++}
++int64_t esp_timer_get_time() {
++  assert(false);
++  return 0;
++}
++int gpio_install_isr_service(int) {
++  assert(false);
++  return 0;
++}
++int gpio_set_intr_type(gpio_num_t, int) {
++  assert(false);
++  return 0;
++}
++int gpio_isr_handler_add(gpio_num_t, void (*)(void*), void*) {
++  assert(false);
++  return 0;
++}
++int gpio_intr_disable(gpio_num_t) {
++  assert(false);
++  return 0;
++}
++int gpio_isr_handler_remove(gpio_num_t) {
++  assert(false);
++  return 0;
++}
++TimerHandle_t xTimerCreateStatic(const char*, TickType_t, int, void*, TimerCallbackFunction_t, StaticTimer_t*) {
++  assert(false);
++  return nullptr;
++}
++int xTimerStart(TimerHandle_t, TickType_t) {
++  assert(false);
++  return 0;
++}
++int xTimerStop(TimerHandle_t, TickType_t) {
++  assert(false);
++  return 0;
++}
++void* pvTimerGetTimerID(TimerHandle_t) {
++  assert(false);
++  return nullptr;
++}
++#include "CaptureSource.inc"
++
++int main() {
++  using Request = HalGPIO::PowerWakeRequest;
++  HalGPIO gpio;
++  assert(gpio.beginPowerWakeCapture());
++  assert(gpio.powerWakeRequest() == Request::None);
++  buttonStatus = freeink::m5pm1::BTN_EVENT;  // Released while main was blocked.
++  assert(gpio.powerWakeRequest() == Request::Verified);
++  assert(buttonStatus == 0);
++  const auto afterEvent = reads;
++  assert(gpio.powerWakeRequest() == Request::Verified && reads == afterEvent);
++  gpio.endPowerWakeCapture();
++  assert(gpio.powerWakeRequest() == Request::None && reads == afterEvent);
++
++  buttonStatus = freeink::m5pm1::BTN_PRESSED;
++  assert(gpio.beginPowerWakeCapture());
++  assert(gpio.powerWakeRequest() == Request::Verified);
++  gpio.endPowerWakeCapture();
++  buttonStatus = 0x40;  // Unrelated status bits do not ask for reader wake.
++  assert(gpio.beginPowerWakeCapture());
++  assert(gpio.powerWakeRequest() == Request::None);
++  readOk = false;
++  assert(gpio.powerWakeRequest() == Request::Verified);  // Leave maintenance on read failure.
++  gpio.endPowerWakeCapture();
++  assert(!gpio.beginPowerWakeCapture());
++  assert(gpio.powerWakeRequest() == Request::None);
++  readOk = true;
++  bootReady = false;
++  assert(!gpio.beginPowerWakeCapture());
++  assert(gpio.powerWakeRequest() == Request::None);
++  std::puts("PMIC capture: latched/held contact, read-clear retention, failure and cleanup PASS");
++}
+--- /dev/null
++++ b/test/papermono_timer/SleepFlowTest.cpp
+@@ -0,0 +1,161 @@
++#include <cassert>
++#include <cstdint>
++#include <string>
++#include <vector>
++
++#define FREEINK_DEVICE_PAPERMONO 1
++#define SOC_PM_SUPPORT_EXT1_WAKEUP 1
++#define ENABLE_SERIAL_LOG
++using gpio_num_t = int;
++constexpr int XTEINK_C3_GPIO13 = 13, OUTPUT = 1, HIGH = 1;
++struct PoweredOff {};
++struct Restarted {};
++static std::vector<std::string> trace;
++static bool armOk = true, cancelOk = true, removePower = true, shutdownOk = true;
++static uint64_t requested = 0;
++#define LOG_ERR(...) trace.push_back("error")
++struct HalGPIO {
++  enum class PowerWakeRequest { None, Verified };
++  static inline PowerWakeRequest request = PowerWakeRequest::None;
++  PowerWakeRequest powerWakeRequest() { return request; }
++};
++static bool pressDuringArm = false, pressDuringShutdown = false, pressDuringSettle = false;
++struct HalPowerManager {
++  void startDeepSleep(HalGPIO&, uint64_t = 0, bool = false) const;
++};
++struct Serial {
++  void end() { trace.push_back("serial-end"); }
++} logSerial;
++namespace BoardConfig {
++struct Profile {
++  struct Power {
++    int8_t latch0 = -1, latch1 = -1;
++  } power;
++} ACTIVE;
++}  // namespace BoardConfig
++void gpio_hold_dis(int) {}
++void gpio_hold_en(int) {}
++void pinMode(int, int) {}
++void digitalWrite(int, int) {}
++void delay(int ms) {
++  assert(ms == 1000);
++  trace.push_back("settle");
++}
++[[noreturn]] void esp_restart() {
++  trace.push_back("restart");
++  throw Restarted{};
++}
++namespace papermonotimer {
++bool arm(uint64_t us) {
++  requested = us;
++  if (pressDuringArm) HalGPIO::request = HalGPIO::PowerWakeRequest::Verified;
++  trace.push_back("arm");
++  return armOk;
++}
++bool cancel() {
++  trace.push_back("cancel");
++  return cancelOk;
++}
++}  // namespace papermonotimer
++namespace freeink {
++struct PowerManager {
++  static void powerDownRailsForSleep() { trace.push_back("rails-off"); }
++  static void armPowerButtonWakeup() { assert(false); }
++  static void deepSleep() { assert(false); }
++  static void deepSleepUntilPowerButton() { assert(false && "PaperMono has no ESP Power wake pin"); }
++};
++namespace m5pm1 {
++bool requestShutdown(bool (*shouldAbort)(void*) = nullptr, void* context = nullptr) {
++  // The SDK's 120 ms settle happens before its abort check and PMIC command.
++  if (pressDuringSettle) HalGPIO::request = HalGPIO::PowerWakeRequest::Verified;
++  if (shouldAbort && shouldAbort(context)) {
++    trace.push_back("abort");
++    return false;
++  }
++  trace.push_back("shutdown");
++  if (pressDuringShutdown) HalGPIO::request = HalGPIO::PowerWakeRequest::Verified;
++  if (removePower) throw PoweredOff{};
++  return shutdownOk;
++}
++}  // namespace m5pm1
++}  // namespace freeink
++#include "SleepSource.inc"
++
++int main() {
++  HalGPIO gpio;
++  HalPowerManager power;
++  try {
++    power.startDeepSleep(gpio, 60000000);
++    assert(false);
++  } catch (const PoweredOff&) {
++  }
++  assert(requested == 60000000);
++  assert((trace == std::vector<std::string>{"serial-end", "rails-off", "arm", "shutdown"}));
++  for (bool result : {false, true}) {
++    trace.clear();
++    removePower = false;
++    shutdownOk = result;
++    try {
++      power.startDeepSleep(gpio, 60000000);
++      assert(false);
++    } catch (const Restarted&) {
++    }
++    const std::vector<std::string> expected =
++        result ? std::vector<std::string>{"serial-end", "rails-off", "arm",   "shutdown",
++                                          "settle",     "cancel",    "error", "restart"}
++               : std::vector<std::string>{"serial-end", "rails-off", "arm", "shutdown", "cancel", "error", "restart"};
++    assert(trace == expected);
++  }
++  trace.clear();
++  armOk = false;
++  cancelOk = true;
++  removePower = true;
++  try {
++    power.startDeepSleep(gpio, 60000001);
++    assert(false);
++  } catch (const PoweredOff&) {
++  }
++  assert((trace == std::vector<std::string>{"serial-end", "rails-off", "arm", "error", "cancel", "shutdown"}));
++  trace.clear();
++  cancelOk = false;
++  try {
++    power.startDeepSleep(gpio, 60000000);
++    assert(false);
++  } catch (const Restarted&) {
++  }
++  assert((trace == std::vector<std::string>{"serial-end", "rails-off", "arm", "error", "cancel", "error", "restart"}));
++  trace.clear();
++  armOk = true;
++  cancelOk = true;
++  removePower = true;
++  try {
++    power.startDeepSleep(gpio);
++    assert(false);
++  } catch (const PoweredOff&) {
++  }
++  assert(requested == 0);
++  assert((trace == std::vector<std::string>{"serial-end", "rails-off", "arm", "shutdown"}));
++  trace.clear();
++  HalGPIO::request = HalGPIO::PowerWakeRequest::Verified;
++  power.startDeepSleep(gpio, 60000000, true);
++  assert(trace.empty());
++  HalGPIO::request = HalGPIO::PowerWakeRequest::None;
++  pressDuringArm = true;
++  power.startDeepSleep(gpio, 60000000, true);
++  assert((trace == std::vector<std::string>{"serial-end", "rails-off", "arm", "cancel"}));
++  trace.clear();
++  HalGPIO::request = HalGPIO::PowerWakeRequest::None;
++  pressDuringArm = false;
++  removePower = false;
++  shutdownOk = false;
++  pressDuringShutdown = true;
++  power.startDeepSleep(gpio, 60000000, true);
++  assert((trace == std::vector<std::string>{"serial-end", "rails-off", "arm", "shutdown", "cancel"}));
++  trace.clear();
++  HalGPIO::request = HalGPIO::PowerWakeRequest::None;
++  pressDuringShutdown = false;
++  pressDuringSettle = true;
++  removePower = true;
++  power.startDeepSleep(gpio, 60000000, true);
++  assert((trace == std::vector<std::string>{"serial-end", "rails-off", "arm", "abort", "cancel"}));
++}
+--- /dev/null
++++ b/test/papermono_timer/check_interval.py
+@@ -0,0 +1,36 @@
++"""Check the production interval gate, including the disabled Metalio target."""
++from pathlib import Path
++import subprocess
++import tempfile
++
++root = Path(__file__).resolve().parents[2]
++base = "59555361aef55608cc56fdb5a9fccc167c37db34"
++sources = [("original", subprocess.check_output(["git", "show", base + ":src/CrossPointSettings.h"], cwd=root, text=True)),
++           ("candidate", (root / "src/CrossPointSettings.h").read_text())]
++with tempfile.TemporaryDirectory(prefix="papermono-interval-") as temporary:
++    temp = Path(temporary)
++    for name, source in sources:
++        start = source.index("  uint64_t getTimedSleepScreenRefreshUs() const {")
++        end = source.index("\n  }", start) + len("\n  }")
++        enum_start = source.index("  enum TIMED_SLEEP_SCREEN_REFRESH")
++        enum_end = source.index("\n  };", enum_start) + len("\n  };")
++        body = "#include <cstdint>\nstruct Settings {\n" + source[enum_start:enum_end]
++        body += "\nuint8_t timedSleepScreenRefresh = 0;\n" + source[start:end] + "\n};\n"
++        body += """int main() {
++          Settings s;
++          if (s.getTimedSleepScreenRefreshUs() != 0) return 1;
++          s.timedSleepScreenRefresh = Settings::TIMED_SLEEP_REFRESH_1_MIN;
++          if (s.getTimedSleepScreenRefreshUs() != (FREEINK_DEVICE_METALIO_EINK4 ? 0ULL : 60000000ULL)) return 42;
++          s.timedSleepScreenRefresh = 255;
++          return s.getTimedSleepScreenRefreshUs() == 0 ? 0 : 2;
++        }"""
++        file = temp / "interval.cpp"
++        file.write_text(body)
++        for paper, metalio in ([(1, 0)] if name == "original" else [(1, 0), (0, 0), (0, 1)]):
++            exe = temp / "interval"
++            subprocess.run(["c++", "-std=c++20", "-Wall", "-Wextra", "-fsanitize=address,undefined",
++                            f"-DFREEINK_DEVICE_PAPERMONO={paper}", f"-DFREEINK_DEVICE_METALIO_EINK4={metalio}",
++                            str(file), "-o", str(exe)], check=True)
++            result = subprocess.run([str(exe)])
++            assert result.returncode == (42 if name == "original" else 0)
++print("Interval: baseline negative42, PaperMono/ESP enabled, Metalio disabled, Off/invalid PASS")
+--- /dev/null
++++ b/test/papermono_timer/run.py
+@@ -0,0 +1,63 @@
++#!/usr/bin/env python3
++"""Exercise actual PaperMono HAL/SDK code with simulated I2C, reset and shutdown."""
++from pathlib import Path
++import argparse
++import subprocess
++import tempfile
++
++parser = argparse.ArgumentParser(description=__doc__)
++parser.add_argument("--negative-control", action="store_true")
++args = parser.parse_args()
++root = Path(__file__).resolve().parents[2]
++here = Path(__file__).resolve().parent
++hardware = root / "freeink-sdk/libs/hardware"
++rtc = hardware / "Rtc"
++base = "59555361aef55608cc56fdb5a9fccc167c37db34"
++
++
++def wake(source):
++    return source[source.index("HalGPIO::WakeupReason HalGPIO::getWakeupReason() const {"):]
++
++
++with tempfile.TemporaryDirectory(prefix="papermono-timer-") as tmp:
++    temp = Path(tmp)
++    variants = [("candidate", (root / "lib/hal/HalGPIO.cpp").read_text())]
++    if args.negative_control:
++        variants.insert(0, ("original", subprocess.check_output(
++            ["git", "show", base + ":lib/hal/HalGPIO.cpp"], cwd=root, text=True)))
++    flags = ["c++", "-std=c++20", "-O0", "-Wall", "-Wextra", "-fsanitize=address,undefined",
++             "-fno-omit-frame-pointer", "-DFREEINK_DEVICE_PAPERMONO=1", "-DFREEINK_CAP_RTC=1"]
++    for path in (temp, rtc / "test/host", rtc / "test/host/stubs", hardware / "BatteryMonitor/test/host/stubs",
++                 rtc / "include", hardware / "BoardConfig/include", root / "lib/hal"):
++        flags += ["-I", str(path)]
++    for name, source in variants:
++        (temp / "WakeSource.inc").write_text(wake(source))
++        exe = temp / name
++        subprocess.run([*flags, str(rtc / "src/Rtc.cpp"), str(here / "PaperMonoTimerTest.cpp"), "-o", str(exe)], check=True)
++        if name == "original":
++            result = subprocess.run([str(exe), "0", "negative-control"])
++            assert result.returncode == 42
++        else:
++            for case in range(13):
++                subprocess.run([str(exe), str(case)], check=True)
++        print(name + ": expected wake outcomes confirmed")
++    source = (root / "lib/hal/HalPowerManager.cpp").read_text()
++    start = source.index("void HalPowerManager::startDeepSleep(")
++    end = source.index("uint16_t HalPowerManager::getBatteryPercentage()", start)
++    (temp / "SleepSource.inc").write_text(source[start:end])
++    exe = temp / "sleep"
++    subprocess.run([*flags, str(here / "SleepFlowTest.cpp"), "-o", str(exe)], check=True)
++    subprocess.run([str(exe)], check=True)
++    capture = (root / "lib/hal/HalGPIO.cpp").read_text()
++    start = capture.index("void IRAM_ATTR HalGPIO::recordPowerWake(")
++    end = capture.index("bool HalGPIO::verifyPowerButtonWakeup()", start)
++    (temp / "CaptureSource.inc").write_text(capture[start:end])
++    exe = temp / "capture"
++    subprocess.run(["c++", "-std=c++20", "-O0", "-Wall", "-Wextra", "-fsanitize=address,undefined",
++                    "-fno-omit-frame-pointer", "-DFREEINK_DEVICE_PAPERMONO=1", "-I", str(temp),
++                    "-I", str(root / "test/timed_power_wake/stubs"), "-I", str(root / "lib/hal"),
++                    str(here / "PowerCaptureTest.cpp"), "-o", str(exe)], check=True)
++    subprocess.run([str(exe)], check=True)
++print("PaperMono: 13 wake/reset cases, RTC API, 10 shutdown/handoff paths and PMIC capture PASS")
++
++subprocess.run(["python3", str(here / "check_interval.py")], check=True)
