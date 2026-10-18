@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "scope": "T4-A compatibility update; dependent integration, not a clean standalone PR",
+  "cpSource": "https://github.com/kivarun/crosspoint-pal.git",
+  "cpBase": "1bc497520f6efacd09920225d5bf319b8f4a9df6",
+  "sdkSource": "https://github.com/Free-Ink/freeink-sdk.git",
+  "sdkBase": "084fdfb24b16e890844ca5cb44951694ba8d6c56",
+  "cpTree": "5d3c62aa7361fdc38c5533dd3045c1af3c8bb665",
+  "sdkTree": "a66646ce15d2b5b886dd25bb9f2963659de7ffbb",
+  "patches": {
+    "cp-integration.patch": "33878270ec4ae201a61ace0b4ae0eba80ad6d29829b16081d96ce854bcfab679",
+    "sdk-verified.patch": "f6d5cb9f46bc4aac8aeaacdbd376889c871bec2545a9ab5e814efd1fc0ed9997"
+  },
+  "previousPublishedTree": "4acd57fc94f3f848eae1052a1d5946b51e65cc9f",
+  "deviceOnThisRevision": "NOT_MEASURED",
+  "firmwareIncluded": false,
+  "privateHelpersIncluded": false
+}

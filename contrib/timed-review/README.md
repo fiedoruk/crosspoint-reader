@@ -1,5 +1,23 @@
 # Verified downloads and timed sleep-screen integration
 
+The [current compatibility package](t4a/README.md) reconstructs the existing
+W06/TIMED integration on timer PR #3820 at `1bc4975`. It preserves the new
+upstream settings/font fixes and moves the Source/interval definitions to the
+shared settings list. The timer, transport and Power behavior stay unchanged.
+
+- [Source ZIP](t4a/t4a-support.zip), pinned refs and replay instructions are included.
+- Classifier comparison, settings host checks and one Sticky build passed.
+- This revision has not been tested on a device. The earlier T3 hardware
+  observations remain tied to its previous binary.
+
+The SDK verification and combined source-selection contracts still need upstream
+agreement. This is dependent review material; no firmware is distributed here.
+
+<details>
+<summary>Previous packages and device evidence</summary>
+
+# Verified downloads and timed sleep-screen integration
+
 Updated 18 October 2026. The [T3 review package](t3/README.md) separates verified
 event downloads (W06) from the shared Off/Local/Plugin timer consumer. It includes
 pinned public prerequisites, replay commands and [validation notes](t3/NOTES.en.md).
@@ -52,5 +70,7 @@ The SDK RTC/PMIC changes from that snapshot are already in the current SDK base.
 
 The [standalone PaperMono timer adapter](../papermono-timer-adapter/README.md)
 remains separate support for PR #3820; this update leaves those files unchanged.
+
+</details>
 
 </details>
