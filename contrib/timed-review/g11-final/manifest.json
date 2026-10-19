@@ -1,0 +1,82 @@
+{
+  "schemaVersion": 1,
+  "classification": "DEPENDENT_REVIEW_PREPUBLICATION",
+  "cpSource": "https://github.com/crosspoint-reader/crosspoint-reader.git",
+  "cpBase": "b64d797c036dd17e2f04b8644e3c4d50c7a87c87",
+  "sdkSource": "https://github.com/Free-Ink/freeink-sdk.git",
+  "sdkBase": "084fdfb24b16e890844ca5cb44951694ba8d6c56",
+  "sdkTree": "a66646ce15d2b5b886dd25bb9f2963659de7ffbb",
+  "cpBaseTree": "6f56dd5a3dd850a26deb20063df9211bc75c6128",
+  "steps": [
+    {
+      "patch": "00-token-storage.patch",
+      "stage": "gh01",
+      "tree": "55b4afcafe6dbf4be0424887685183a1d6c4087f",
+      "role": "Existing #3956 prerequisite at bb3460bc"
+    },
+    {
+      "patch": "01-checked-bmp.patch",
+      "stage": "w04",
+      "tree": "221d7aa21c2b005b1fc94c78b45881cb0e3c3c64",
+      "role": "Existing #3907 prerequisite"
+    },
+    {
+      "patch": "02-bounded-events.patch",
+      "stage": "prerequisites",
+      "tree": "dcb30bf9720a59187fa759ccd87627176c2d979c",
+      "role": "Existing #3908 prerequisite"
+    },
+    {
+      "patch": "03-verified-events.patch",
+      "stage": "w06",
+      "tree": "4b1c5259127b28aa197591b9f5c84b653aba2d44",
+      "role": "W06 review scope"
+    },
+    {
+      "patch": "04-timer-prerequisite.patch",
+      "stage": "timedPrerequisites",
+      "tree": "88516e672e717f79b672473ab5e31b1e5e0b2ef6",
+      "role": "kivarun #3820 at1bc4975; CMake context adapted"
+    },
+    {
+      "patch": "05-timed-source.patch",
+      "stage": "timed",
+      "tree": "0e6160a3cf6f350b8f1368dde0f274e75de85ff7",
+      "role": "TIMED review scope"
+    }
+  ],
+  "patches": {
+    "00-token-storage.patch": "2a39a4d79e3ed3311e68bf9d6da36e1a58ad21857e14e9206a41ce3253240688",
+    "01-checked-bmp.patch": "a12e071e4689b3f42e3c865498d275acf6d2a1b9701bb5270412133dde45bab3",
+    "02-bounded-events.patch": "080a05952b8c5e747c84da22ee0a78be91fe91e5c3045e82b5a65d363de80d4d",
+    "03-verified-events.patch": "b15ee47d2bc4cca356c780f26e696ef776c3e40b2df3c63157c5ceb0dd1675ff",
+    "04-timer-prerequisite.patch": "88d41e083cf3c55a5e1c04e4b357a4da22088f97b83cb6e800ea3fafb6054163",
+    "05-timed-source.patch": "c0b61c50e06f0673d18ad2ed183446389600efe4c814a43762e90082c68523f3",
+    "sdk-verified.patch": "f6d5cb9f46bc4aac8aeaacdbd376889c871bec2545a9ab5e814efd1fc0ed9997"
+  },
+  "proposedPrs": [
+    {
+      "id": "W06",
+      "patch": "03-verified-events.patch",
+      "baseTree": "dcb30bf9720a59187fa759ccd87627176c2d979c",
+      "resultTree": "4b1c5259127b28aa197591b9f5c84b653aba2d44"
+    },
+    {
+      "id": "TIMED",
+      "patch": "05-timed-source.patch",
+      "baseTree": "88516e672e717f79b672473ab5e31b1e5e0b2ef6",
+      "resultTree": "0e6160a3cf6f350b8f1368dde0f274e75de85ff7"
+    }
+  ],
+  "prerequisiteRefs": {
+    "GH01": "bb3460bc975df507b5e1a78e7b64373b8364141a",
+    "W04": "e401c849c4026f9cca857a755cf104f75c4b1237",
+    "W05": "f443af3309c8e1461cf79a60cdc5ca8affc517e3",
+    "timer": "1bc497520f6efacd09920225d5bf319b8f4a9df6",
+    "SDK65": "6d33e9fd8c6fd1c53c40c0ef1ccaa4535606610a"
+  },
+  "sdkGitlinkChanged": false,
+  "firmwareIncluded": false,
+  "privateBenchHelpersIncluded": false,
+  "deviceOnThisRevision": "NOT_MEASURED"
+}

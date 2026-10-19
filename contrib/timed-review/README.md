@@ -1,3 +1,19 @@
+## Separate W06 and TIMED review scopes — 19 October 2026
+
+The [current source packet](g11-final/README.md) separates verified plugin events
+from their timed consumer. It replays W06 on its own, then adds the existing
+upstream timer and TIMED. [Validation](g11-final/VALIDATION.md),
+[W06 scope](g11-final/pr-w06.en.md), [TIMED scope](g11-final/pr-timed.en.md)
+and the [ZIP](g11-final/g11-final-review.zip) are included.
+
+This packet is pinned to CP `b64d797c` and SDK `084fdfb` with its explicit
+verification adaptation. Develop has since advanced to `261726f6` with BOOX
+Picco and shared SDK/HAL changes; that newer base is not qualified by this packet.
+SDK/API acceptance, C3 runtime evidence and the consumer's scope remain open.
+Earlier packages below retain their original evidence and limitations.
+
+---
+
 # Verified downloads and timed sleep-screen integration
 
 The [current compatibility package](t4a/README.md) reconstructs the existing
