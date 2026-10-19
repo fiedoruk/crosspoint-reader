@@ -1,0 +1,63 @@
+{
+  "schemaVersion": 1,
+  "cpSource": "https://github.com/crosspoint-reader/crosspoint-reader.git",
+  "cpBase": "ad971c8ac03c9765e3835b3b54ee56f0b0332abe",
+  "cpBaseTree": "eb629ba1f0de24dd4f1d68d72958b6362fc41ce8",
+  "sdkSource": "https://github.com/Free-Ink/freeink-sdk.git",
+  "sdkBase": "25cd36c7c28192991f11ba99c1f520d19ff12fa5",
+  "firmwareIncluded": false,
+  "deviceOnThisRevision": "NOT_MEASURED",
+  "scope": "W06 then TIMED on reconciled timer; explicit dependencies",
+  "reviewStages": [
+    "w06",
+    "timed"
+  ],
+  "sdkTree": "6887ae30f6b7af76e30c0cf803e5139c51d63b9b",
+  "steps": [
+    {
+      "patch": "00-token-storage.patch",
+      "stage": "gh01",
+      "tree": "3d0c3970aaa6c1714967174b7aabb1b0ebab87bf"
+    },
+    {
+      "patch": "01-checked-bmp.patch",
+      "stage": "w04",
+      "tree": "749efeee9b6461662c3dda5908ab733836f3fdb5"
+    },
+    {
+      "patch": "02-bounded-events.patch",
+      "stage": "prerequisites",
+      "tree": "ec8f4e33a0a5e62376e12e3ae9b46a43f4de0199"
+    },
+    {
+      "patch": "03-verified-events.patch",
+      "stage": "w06",
+      "tree": "89016f8e9777a0967e522864f5a2e507ca765b12"
+    },
+    {
+      "patch": "04-timer-prerequisite.patch",
+      "stage": "timedPrerequisites",
+      "tree": "7732f60f7abd5e35817d8db10fb2491016f4e084"
+    },
+    {
+      "patch": "05-timed-source.patch",
+      "stage": "timed",
+      "tree": "aa0c8484789a101a88cbccfb9a744a0e791100ec"
+    }
+  ],
+  "patches": {
+    "00-token-storage.patch": "2a39a4d79e3ed3311e68bf9d6da36e1a58ad21857e14e9206a41ce3253240688",
+    "01-checked-bmp.patch": "a12e071e4689b3f42e3c865498d275acf6d2a1b9701bb5270412133dde45bab3",
+    "02-bounded-events.patch": "080a05952b8c5e747c84da22ee0a78be91fe91e5c3045e82b5a65d363de80d4d",
+    "03-verified-events.patch": "b15ee47d2bc4cca356c780f26e696ef776c3e40b2df3c63157c5ceb0dd1675ff",
+    "04-timer-prerequisite.patch": "41f14bc62966d0afe11b54e730a4d36e938189d6afc7cddf84e583a5a7b29a00",
+    "05-timed-source.patch": "110bca6027eddb3e411b88f7c436b37b1b62956f680e2363576102e62a3842fb",
+    "sdk-verified.patch": "f6d5cb9f46bc4aac8aeaacdbd376889c871bec2545a9ab5e814efd1fc0ed9997"
+  },
+  "piccoConsumerEnabled": false,
+  "networkConsumerModels": [
+    "Sticky",
+    "X4 Pro",
+    "PaperMono"
+  ]
+}

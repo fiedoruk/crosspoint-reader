@@ -1,3 +1,14 @@
+## Timer/W06/TIMED compatibility reference — 19 October 2026
+
+The [current reference](compat-ad971/README.md) contains separate timer and
+W06/TIMED packets pinned to CP `ad971c8a` / SDK `25cd36c7`. Their validation
+includes targeted host checks, fresh replay and one full integration C3 build.
+Newer develop `91ed3ef8` / SDK `f9cc1bed` needs a test-registration refresh and
+TIMED settings visitor adaptation; that newer base is not build-qualified here.
+Earlier checkpoints below keep their original evidence and limits.
+
+---
+
 ## Separate W06 and TIMED review scopes — 19 October 2026
 
 The [current source packet](g11-final/README.md) separates verified plugin events
