@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "cpSource": "https://github.com/crosspoint-reader/crosspoint-reader.git",
+  "cpBase": "91ed3ef8a48962e0066a22b149cab3dfa0a0ee05",
+  "cpBaseTree": "28b31f9719a1fbdd1379df448e1d48fd39720370",
+  "sdkSource": "https://github.com/Free-Ink/freeink-sdk.git",
+  "sdkBase": "f9cc1beda45f4d2d3dade69fc444165727424f53",
+  "firmwareIncluded": false,
+  "deviceOnThisRevision": "NOT_MEASURED",
+  "scope": "Rebase support for kivarun timer PR3820; no consumer or SDK patch",
+  "reviewStages": [
+    "timer"
+  ],
+  "sdkTree": "c3a6a31f47c16c38f811295a10497c96886a0516",
+  "timerOriginalHead": "1bc497520f6efacd09920225d5bf319b8f4a9df6",
+  "steps": [
+    {
+      "patch": "timer-on-develop.patch",
+      "stage": "timer",
+      "tree": "1659e0391e522ce2f3f65c72103bd9a7e65ee014"
+    }
+  ],
+  "patches": {
+    "timer-on-develop.patch": "0dda71e689e8042eaba2ac8f81ca7debaee7bfb3c8cdff70f155f6f4fa17ff42"
+  }
+}

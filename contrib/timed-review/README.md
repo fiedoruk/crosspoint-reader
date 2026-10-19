@@ -1,3 +1,17 @@
+## Settings visitor checkpoint — 19 October 2026
+
+The [latest published checkpoint](visitor-91ed/README.md) contains the timer
+reference and W06/TIMED series on CP `91ed3ef8` / SDK `f9cc1bed`. It completes
+the settings-visitor and CMake adaptation, with scoped host/replay evidence
+and one full C3 build.
+
+The author has since rebased #3820 to `e926eac8` with timer interval second
+and held-button flag third. The frozen checkpoint uses the previous order;
+consumer alignment is the next step. The compatibility note records that
+difference and the later web-UI-only develop commit `0fcdb3ec`.
+
+---
+
 ## Timer/W06/TIMED compatibility reference — 19 October 2026
 
 The [current reference](compat-ad971/README.md) contains separate timer and

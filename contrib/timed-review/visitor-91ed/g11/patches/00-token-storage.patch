@@ -1,0 +1,45 @@
+diff --git a/src/util/PluginHttp.cpp b/src/util/PluginHttp.cpp
+index 34786e0..caec4dc 100644
+--- a/src/util/PluginHttp.cpp
++++ b/src/util/PluginHttp.cpp
+@@ -153,18 +153,14 @@ bool saveTokenToFile(const std::string& file, const std::string& path, const std
+   JsonVariant node = doc.to<JsonObject>();
+   for (size_t i = 0; i + 1 < segs.size(); i++) node = node[segs[i]].to<JsonObject>();
+   node[segs.back()] = value;
+-  std::string out;
++  String out;
+   serializeJson(doc, out);
+-  HalFile f;
+-  if (!Storage.openFileForWrite("PHTP", file, f)) return false;
+-  const size_t written = f.write(out.data(), out.size());
+-  f.flush();
+-  if (written != out.size()) {
+-    // A short write (SD full, I/O fault) must not persist a truncated token:
+-    // the writer would report success, then every later load fails.
+-    LOG_ERR("PHTP", "short token write (%u of %u)", static_cast<unsigned>(written), static_cast<unsigned>(out.size()));
+-    if (f.isOpen()) f.close();
+-    Storage.remove(file.c_str());
++  if (doc.overflowed() || out.length() > MAX_TOKEN_FILE_SIZE || out.length() != measureJson(doc)) {
++    LOG_ERR("PHTP", "Invalid or oversized token JSON");
++    return false;
++  }
++  if (!Storage.writeFile(file.c_str(), out)) {
++    LOG_ERR("PHTP", "Failed to save token file");
+     return false;
+   }
+   return true;
+diff --git a/src/util/PluginHttp.h b/src/util/PluginHttp.h
+index 747c0d5..d8d2c59 100644
+--- a/src/util/PluginHttp.h
++++ b/src/util/PluginHttp.h
+@@ -64,8 +64,8 @@ std::string inPluginDir(const std::string& pluginDir, const char* path);
+ bool loadTokenFromFile(const std::string& file, const std::string& path, std::string& out);
+ 
+ // Writes `value` at `path` into `file`, building the nesting the read path
+-// expects (numeric segments unsupported). Removes the file on a short write so
+-// a truncated token is never persisted.
++// expects (numeric segments unsupported). Uses Storage.writeFile to keep the
++// previous file on a short write or failed close.
+ bool saveTokenToFile(const std::string& file, const std::string& path, const std::string& value);
+ 
+ // Loads a flat JSON config file into {cfg.KEY} pairs. Missing file = empty.
