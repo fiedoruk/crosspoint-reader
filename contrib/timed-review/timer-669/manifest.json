@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "cpSource": "https://github.com/crosspoint-reader/crosspoint-reader.git",
+  "cpBase": "0fcdb3ec504619f5cbda430614642ed8a666b0b1",
+  "cpBaseTree": "3e08689f0173cfb885940e1871785e9fdb145501",
+  "sdkSource": "https://github.com/Free-Ink/freeink-sdk.git",
+  "sdkBase": "f9cc1beda45f4d2d3dade69fc444165727424f53",
+  "firmwareIncluded": false,
+  "deviceOnThisRevision": "NOT_MEASURED",
+  "scope": "Full TIMED on author bool-second timer contract; O142 regressions retained",
+  "reviewStages": [
+    "w06",
+    "timed"
+  ],
+  "sdkTree": "821b2e777fae1bf2e3eedbcd6c623b56bbb3fbc8",
+  "steps": [
+    {
+      "patch": "00-token-storage.patch",
+      "stage": "gh01",
+      "tree": "61de8c123894c96e3d390ce6f2e2c5d7e2884592"
+    },
+    {
+      "patch": "01-checked-bmp.patch",
+      "stage": "w04",
+      "tree": "43c61d30f133ae4769625d7f39afd4a9bdb76227"
+    },
+    {
+      "patch": "02-bounded-events.patch",
+      "stage": "prerequisites",
+      "tree": "91c9e78478c455e0497b9d989143b1d80b73171b"
+    },
+    {
+      "patch": "03-verified-events.patch",
+      "stage": "w06",
+      "tree": "a200411f74bfa4f28556e500d973988c134c15aa"
+    },
+    {
+      "patch": "04-timer-prerequisite.patch",
+      "stage": "timedPrerequisites",
+      "tree": "a01fa3e616027d42c42bb01df07095022a0ed94c"
+    },
+    {
+      "patch": "05-timed-source.patch",
+      "stage": "timed",
+      "tree": "30ef5b387d1c958950b562597c6fdd3af9eeeeb7"
+    }
+  ],
+  "patches": {
+    "00-token-storage.patch": "85b31eda00223e685c9f1261864eee9a5a0cc1a5f5305a83d0d6c1ac7d1b0842",
+    "01-checked-bmp.patch": "a12e071e4689b3f42e3c865498d275acf6d2a1b9701bb5270412133dde45bab3",
+    "02-bounded-events.patch": "04ec6a3d60813d353553162253db775ac148e6c3405203578a5aefa5ff73744a",
+    "03-verified-events.patch": "b089d002a3e52c7ca4193ab5dc5acab26b63e0e973f062c8caaef0c172022131",
+    "04-timer-prerequisite.patch": "d8f46f9aa859731387922e764de06ca851ddc389e47f6b74f708f2a187d85713",
+    "05-timed-source.patch": "0468f56a547cec44867da01750e8f14ea6d0160d474aedcecc83b2612777d3ca",
+    "sdk-verified.patch": "f6d5cb9f46bc4aac8aeaacdbd376889c871bec2545a9ab5e814efd1fc0ed9997"
+  },
+  "piccoConsumerEnabled": false,
+  "networkConsumerModels": [
+    "Sticky",
+    "X4 Pro",
+    "PaperMono"
+  ],
+  "timerHead": "669642d243c3feec5644e21abe71f1ee760348ab",
+  "timerSource": "https://github.com/kivarun/crosspoint-pal.git",
+  "timerEquivalentHead": "a38095cf3f73402456538c1893142061c72a4c31"
+}

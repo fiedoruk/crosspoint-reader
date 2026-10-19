@@ -1,3 +1,19 @@
+# Current TIMED consumer: bool-second timer API
+
+The [timer-669 packet](timer-669/README.md) follows the author's `669642d2`
+contract on CP `0fcdb3ec` / SDK `f9cc1bed`: held-button second, interval third.
+The newer author head `a38095cf` has an identical source tree. The consumer
+keeps its existing fourth recovery argument and the argument-regression checks.
+
+Eight selected CTests, TIMED host checks, one full C3 build and fresh W06/TIMED
+replays passed. [Validation](timer-669/VALIDATION.md) distinguishes those results
+from hardware, C3 runtime heap and earlier TLS evidence. This is dependent
+integration support, not an official firmware release or a new timer PR.
+
+Earlier checkpoints remain below with their original refs and evidence.
+
+---
+
 ## Settings visitor checkpoint — 19 October 2026
 
 The [latest published checkpoint](visitor-91ed/README.md) contains the timer
