@@ -1,3 +1,16 @@
+## Current CP 2 integration — 9 November 2026
+
+[W06/TIMED review packet](cp2-g12/README.md) for CP `f8db833f` / SDK
+`ac146e47`, retaining timer `a38095cf`. Fresh replay, scoped host/TLS checks
+and full builds for C3, Sticky, X4 Pro and PaperMono passed. The PaperMono
+RTC failure fallback is corrected. [Validation](cp2-g12/VALIDATION.md)
+distinguishes those results from the still-missing device acceptance and C3
+runtime heap measurement. SDK contract/ref and consumer scope remain open.
+
+Earlier checkpoints below remain available at their original refs.
+
+---
+
 # Current TIMED consumer: bool-second timer API
 
 The [timer-669 packet](timer-669/README.md) follows the author's `669642d2`
