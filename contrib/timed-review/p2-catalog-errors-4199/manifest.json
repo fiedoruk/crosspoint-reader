@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "scope": "Support for existing PR4199; one-line diagnostic log minimization",
+  "prHead": "83be676044276c3f13bd6485758739bd38814151",
+  "sdkPin": "a5d5332e82502198ad1bc5a6236eca57afab39d9",
+  "originalPrAuthor": "osteotek",
+  "files": {
+    "LICENSE": "5d025639b5237e35cf93c4ca598ebde40f31f032bf9a9a19fceb3703dca68b84",
+    "candidate.patch": "912856a392f0ba0ae8396d7a0aa637e53f548dbc3853b41c7c6da77ff4faab48",
+    "README.md": "e0b5a7fd5ed68f182ea7e5866637f80c0ffbf942a0bdf2e17fd8a3b3270ca2e1",
+    "tests/run.py": "fdb61f94bb55dbf8c108968f55462ae6311a8a6bfdfca5c93420d4acaf50610a",
+    "tests/harness.cpp": "4f0498136cd4b6790d0d78d08308ca283c4dc8d55eeed5b540055795d558302e"
+  },
+  "firmwareIncluded": false,
+  "published": false,
+  "device": "NOT_MEASURED"
+}

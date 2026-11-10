@@ -1,0 +1,13 @@
+diff --git a/src/activities/CatalogActivity.cpp b/src/activities/CatalogActivity.cpp
+index 9c71c0ab..3743ccb5 100644
+--- a/src/activities/CatalogActivity.cpp
++++ b/src/activities/CatalogActivity.cpp
+@@ -210,7 +210,7 @@ void CatalogActivity::finishDownload(const HttpDownloader::DownloadError result,
+   } else if (result == HttpDownloader::OK || result == HttpDownloader::ABORTED) {
+     downloadFinished(result == HttpDownloader::ABORTED);
+   } else {
+-    LOG_ERR("CAT", "Download failed: %d %s", static_cast<int>(result), detail.c_str());
++    LOG_ERR("CAT", "Download failed: %d", static_cast<int>(result));
+     fail(StrId::STR_DOWNLOAD_FAILED, detail);
+   }
+ }
