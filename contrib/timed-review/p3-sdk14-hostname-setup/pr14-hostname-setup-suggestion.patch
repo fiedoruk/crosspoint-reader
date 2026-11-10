@@ -1,0 +1,14 @@
+--- a/libs/network/SecureNet/src/SecureClient.cpp
++++ b/libs/network/SecureNet/src/SecureClient.cpp
+@@ -154,7 +154,10 @@
+     // Chain verification alone accepts ANY certificate signed by the trusted
+     // roots, regardless of which server it was issued to. Also match the
+     // hostname against the certificate's SAN/CN.
+-    wolfSSL_check_domain_name(ssl, host);
++    if (wolfSSL_check_domain_name(ssl, host) != WOLFSSL_SUCCESS) {
++      stop();
++      return 0;
++    }
+   }
+ #endif
+ 

@@ -1,0 +1,30 @@
+{
+  "scope": "SDK14 author support only; N32 and private project excluded",
+  "prHead": "34aabdf2c8045dc90df6ec1b95f974224d8fcf37",
+  "patchSha256": "63874239c7a3686e4611558bb0d1bebc0ecfa36d3914aa4f54cd35c4c347fd4d",
+  "files": {
+    "run.py": "cbaa0be3f34ac1b5aff28b70371dfe79d5cb52a3e05a901731eb9dba50d45e75",
+    "LICENSE-CP": "b489ce1358e321a2ba270c4764cd2afbb5347eae44fbe26ea994e4684ab65bf0",
+    "build_wolfssl.py": "94aecd349f5e86724a68d75c35e39c0e6b26cfeb3cb0d1bd7452f7a3da995642",
+    "README.md": "4d84b7b3b36787f8da9a64f482907eb9b7c7849093cad28afddd07bf0f8da5b1",
+    "pr14-hostname-setup-suggestion.patch": "63874239c7a3686e4611558bb0d1bebc0ecfa36d3914aa4f54cd35c4c347fd4d",
+    "contract_client.cpp": "e65c77d709430199e26d46ee42cb84c6a8457d15f76a2645f6489bf5cde5fcb4",
+    "LICENSE-SDK": "17dea5079d9905fbbc8323cde7bfffd0f24185949c43a5daad5177022b796588",
+    "NOTICE-SDK": "1a45b9f057b415f84085d808bd12ec5df1296808ad14bd9583f2a585c84290ff",
+    "transport_stubs/Client.h": "38f7b01ea41a0b0a92b0c49a7ae0b33c2513cbe4c9bf257c8148ccd2ae5576e1",
+    "transport_stubs/WiFiClient.h": "3981ec0b67fcedbc19b8b5c806ceb36dbf097877a44c9d88fe9449a0df8a8a2d",
+    "transport_stubs/Network.h": "a06c3aa6eadb920c74d3ac56b39ee053c13371391223eec9cf195793443b5ba3",
+    "transport_stubs/Arduino.h": "9e3b1f13322c269ed148640f8de71e0aa41056b6230ccdc9a750f7c96fd50801",
+    "fixture/fixture.py": "b54c04d8377d73897304b6135e8f322263c13e5ec68114aab5285689bf27759c",
+    "fixture/certificates.py": "82c4e8d233216d7767b34a60fd1e76b846e416975f1d4435d191bc4cfd6446b9",
+    "sources/pr14/libs/network/SecureNet/include/SecureClient.h": "a17f8e1f007cc4e79e7614e9d823485706d56d1b77855fc6cf0b0a2dd4f489b3",
+    "sources/pr14/libs/network/SecureNet/include/SecureHttpClient.h": "eb8c85ab08c62ef4472605bf731030f25dd2c3b481265bd0c199e0576e565db2",
+    "sources/pr14/libs/network/SecureNet/src/SecureClient.cpp": "4e8bcfa5c8e911c0b55ca800f09f5d0ec413ac3bddc7c8b5b7fc4f7bac13db8d",
+    "sources/pr14-fixed/libs/network/SecureNet/include/SecureClient.h": "a17f8e1f007cc4e79e7614e9d823485706d56d1b77855fc6cf0b0a2dd4f489b3",
+    "sources/pr14-fixed/libs/network/SecureNet/src/SecureClient.cpp": "6890911b712b58d122095baf0b972bd48f1b90e5e95e4a3b9c6400e804f5cf9f"
+  },
+  "device": "NOT_MEASURED",
+  "firmwareBuild": "NOT_MEASURED",
+  "published": false,
+  "nativeReceiver": "PASS_6_EXPECTED_OBSERVATIONS"
+}
