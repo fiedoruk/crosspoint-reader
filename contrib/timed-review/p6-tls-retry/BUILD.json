@@ -1,0 +1,15 @@
+{
+  "status": "PASS",
+  "target": "default",
+  "cpTree": "22c67de7a62e37a02bf43263bc6413fc95c91336",
+  "sdkTree": "b3f56ca0f4ea5e5641fd2f69ba77fa7c99b7a8ca",
+  "memoryLines": [
+    "RAM:   [==        ]  20.4% (used 66944 bytes from 327680 bytes)",
+    "Flash: [========= ]  85.4% (used 5600017 bytes from 6553600 bytes)"
+  ],
+  "firmware.bin": {
+    "bytes": 5614544,
+    "sha256": "2749e1d4454a08ca659a63b46801e816000b86111b1fe0342c0cab8b50449d4f"
+  },
+  "device": "NOT_MEASURED"
+}

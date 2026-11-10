@@ -1,0 +1,21 @@
+{
+  "result": "PASS_SCOPED",
+  "beforeAfterHostCases": 24,
+  "recipientCases": 24,
+  "consumerRealTlsCases": 4,
+  "secureNetHostSuite": "PASS",
+  "independentReviewAxes": 4,
+  "build": "one C3/default",
+  "notMeasured": [
+    "hardware",
+    "C3 runtime heap",
+    "energy",
+    "hard end-to-end deadline"
+  ],
+  "faultsInjected": [
+    "hostname setup",
+    "first negotiation",
+    "handshake timeout"
+  ],
+  "sanitizers": "client and harness only; static wolfSSL archive not instrumented"
+}

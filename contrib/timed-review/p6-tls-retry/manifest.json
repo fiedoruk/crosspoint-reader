@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "p4Commit": "f7dbdb3c673526b15b4732f2fa6e7849452dea29",
+  "p4ManifestSha256": "d86b92244b45a3377cf6a7e8531517592ca6d2a5962ee5d48e7495a4c11fd4b3",
+  "sdkBase": "5f0d52196a770947f7f27f15701c2b1430569697",
+  "sdkPrerequisiteTree": "942814decb094f492771ce63aed20161dcd1c7e3",
+  "candidate": {
+    "libs/network/SecureNet/src/SecureClient.cpp": "627a7bf832e008f8deace78c76cdcfc868b9687b2fdbb3cfc83a1a8848c31729",
+    "libs/network/SecureNet/include/SecureClient.h": "5938f7e0ed1b003ada275a5e594d8da6de544fed9195e59359e3aa07cef8b83d"
+  },
+  "candidateTree": "b3f56ca0f4ea5e5641fd2f69ba77fa7c99b7a8ca",
+  "files": {
+    "ATTRIBUTION.md": "ab185cfcfeef4f7974d34a70115891881aba0b6080134616dfe11bf344095440",
+    "BUILD.json": "c2d9ba9646cdd5c03cf3d561c4f233aa2b182e327fbad201ac274931712ac4a2",
+    "LICENSE": "b489ce1358e321a2ba270c4764cd2afbb5347eae44fbe26ea994e4684ab65bf0",
+    "NOTICE-SDK": "05da677948873f09a5d52f449e99af462feed6c4cdaea244f098a6adc5eeb08a",
+    "README.en.md": "94a346764515ba7b6b4cdb9ba601b1758699118070b86076600eb9a27e8755f0",
+    "REPRODUCE.md": "28fb1d217de24c46930b8f43af29e6d2e3ef80f15154daedb025aed83101fe24",
+    "SDK-LICENSE.txt": "17dea5079d9905fbbc8323cde7bfffd0f24185949c43a5daad5177022b796588",
+    "VALIDATION.json": "a337857b9b242f1a91d57559d061413b1088ef77249f80da8b786345b7335a44",
+    "baseline/include/SecureClient.h": "200af65277195c36edb2a78022aae68311a6b0fb968bfc086763f56a30ee66f9",
+    "baseline/src/SecureClient.cpp": "9463d1f29f8d729d861d6c928ce510134f3fadc430c7b684a1f42b5001027300",
+    "build_wolfssl.py": "3f033ee3a10b4e4263729fcc151de3d2de883c3869a89e981851b1bbbe233174",
+    "fixture/certificates.py": "82c4e8d233216d7767b34a60fd1e76b846e416975f1d4435d191bc4cfd6446b9",
+    "fixture/fixture.py": "b54c04d8377d73897304b6135e8f322263c13e5ec68114aab5285689bf27759c",
+    "replay.py": "6360cc269caa38e6aee609656c2c6001779cd6966a5e0222cee0e666032ab7c0",
+    "retry.patch": "aae8571652e11240a2e7d5ae417d8c0fd4e0ea39bf800f54ad789eff8af272c0",
+    "test/retry_client.cpp": "c718ee20e293590528651edc1c6bc0242e9851cf1944bfc967d23c68d2ce2f12",
+    "test/run.py": "1cef7a07755f3318dc868f7a58a4385add68a5bb61c4e2c75251339f03cb5fb5"
+  },
+  "scope": "dependent support overlay; no publication or device acceptance"
+}
