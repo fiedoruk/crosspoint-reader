@@ -1,0 +1,67 @@
+{
+  "schemaVersion": 1,
+  "cpSource": "https://github.com/crosspoint-reader/crosspoint-reader.git",
+  "cpBase": "36bd50d089a8b3f14b0cfc29dd5ae6ffeb197254",
+  "cpBaseTree": "cdb75e884acbdb852c7a7b1bfa16e462ba6ccff5",
+  "sdkSource": "https://github.com/Free-Ink/freeink-sdk.git",
+  "sdkBase": "6a208c0c46cce99bafa334bc4f171f5e558c5195",
+  "sdkTree": "6fbe86ea33fce1cd0907e99f3a8354df61de18c2",
+  "scope": "CP2-era W06 and full TIMED with current upstream transport, settings, wallpaper and Power paths",
+  "firmwareIncluded": false,
+  "deviceOnThisRevision": "NOT_MEASURED",
+  "reviewStages": [
+    "w04",
+    "prerequisites",
+    "w06",
+    "timed"
+  ],
+  "steps": [
+    {
+      "patch": "00-token-storage.patch",
+      "stage": "gh01",
+      "tree": "c760046eaec9b43229f8b10eed74f743039b30d0"
+    },
+    {
+      "patch": "01-checked-bmp.patch",
+      "stage": "w04",
+      "tree": "3a5ccda3969ae8908c24a55a7f793790519b04e1"
+    },
+    {
+      "patch": "02-bounded-events.patch",
+      "stage": "prerequisites",
+      "tree": "52e9cb98ffb38a1b9521027b0d50aac42b1e0fec"
+    },
+    {
+      "patch": "03-verified-events.patch",
+      "stage": "w06",
+      "tree": "2beb0ff4f00fbff5717a15945934bcc031abd6c5"
+    },
+    {
+      "patch": "04-timer-prerequisite.patch",
+      "stage": "timedPrerequisites",
+      "tree": "2088726704008576dcd5fe34f1af4b4c53180554"
+    },
+    {
+      "patch": "05-timed-source.patch",
+      "stage": "timed",
+      "tree": "dde9bbf15a5f893e43677b365b7084c3956ba69f"
+    }
+  ],
+  "patches": {
+    "00-token-storage.patch": "7d4e02449b36afea01e49813716e1f088ac9a7c45ecb2cbbd5619be10186f598",
+    "01-checked-bmp.patch": "b251f6e7391096d118c228a8ad44eb0eee1c698790b3179392dedc9e03404421",
+    "02-bounded-events.patch": "c23fe6b60aa84f651b0b87a443adbd00986f3c4621c26f717bfdeed73bac9c0f",
+    "03-verified-events.patch": "2bd3e1ef7ffcc0ec746b65f9717957373a025e36d9a94973adf4a71073b01627",
+    "04-timer-prerequisite.patch": "59d0339af0421eeeef8d5e811bf443ef1265cea29c97cae2f2e116d8b42ced68",
+    "05-timed-source.patch": "a744ac531a7a184d729620ad8430cf640f74f4fc0ff45084030658d82c919a52",
+    "sdk-verified.patch": "3535390857c7f633dea1fcd131a0f6fb3b3a9b51015f58d33edc73e887690e70"
+  },
+  "timerHead": "a38095cf3f73402456538c1893142061c72a4c31",
+  "timerAuthor": "Michael Kazakov / kivarun",
+  "networkConsumerModels": [
+    "Sticky",
+    "X4 Pro",
+    "PaperMono"
+  ],
+  "publicationStatus": "LOCAL_CANDIDATE_NOT_PUBLISHED"
+}

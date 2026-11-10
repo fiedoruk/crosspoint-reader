@@ -1,3 +1,12 @@
+## Current integration — 10 November 2026
+
+[W06/TIMED on CP36bd](cp2-36bd/README.md) includes the upstream WebDAV and
+PageLink fixes, with focused host checks and a final C3 build. The SDK patch
+remains on6a208c0c. [Validation](cp2-36bd/VALIDATION.md) separates new checks,
+retained TLS evidence and unmeasured device behavior. Earlier packets remain below.
+
+---
+
 ## Current CP 2 integration — 9 November 2026
 
 [W06/TIMED review packet](cp2-g12/README.md) for CP `f8db833f` / SDK
