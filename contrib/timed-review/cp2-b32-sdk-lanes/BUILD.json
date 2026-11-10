@@ -1,0 +1,16 @@
+{
+  "status": "PASS",
+  "target": "default / ESP32-C3",
+  "scope": "full P1 stage, future-qualification lane only",
+  "cpBase": "b32f907e5b6bcdaf80dad5b2fb52a3b3ef869802",
+  "cpTree": "22c67de7a62e37a02bf43263bc6413fc95c91336",
+  "cpSdkGitlink": "6a208c0c46cce99bafa334bc4f171f5e558c5195",
+  "actualSdkHead": "5f0d52196a770947f7f27f15701c2b1430569697",
+  "sdkTree": "942814decb094f492771ce63aed20161dcd1c7e3",
+  "sourceDrift": false,
+  "officialPinBuild": "NOT_RUN",
+  "w06OnlyBuild": "NOT_RUN",
+  "firmwareIncluded": false,
+  "device": "NOT_MEASURED",
+  "runtimeHeap": "NOT_MEASURED"
+}
