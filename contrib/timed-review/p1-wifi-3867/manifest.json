@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "scope": "PR3867 stock support plus optional existing TIMED integration delta",
+  "cpBase": "36bd50d089a8b3f14b0cfc29dd5ae6ffeb197254",
+  "prHead": "737f1aa02f98126aaacab1847b3f3c550cf32b67",
+  "originalAuthor": "garciacd",
+  "files": {
+    "timed-3867.patch": "56ba385be37a3feccdf54e72aca3cd9b4aa2e3cf472f336d2e11a21380a302b8",
+    "timed-harness.patch": "aa2daee7294770aa5a617a7c37403bff479a9359a8a659c23effbc3f58e91294",
+    "LICENSE": "b489ce1358e321a2ba270c4764cd2afbb5347eae44fbe26ea994e4684ab65bf0",
+    "stock-3867.patch": "5f29db93bb20082823324a3500cab907ad6249d0b8fff41a809ff529ea125679",
+    "README.md": "03f512239ac0f66564aea2526caf601c0b82fe20905901c8a68334482d0cdb92",
+    "test/wifi_fallback/run.py": "1fc90ff10c5dc905816bc678eb0e17863ae0cec995968fc298c04e2531ce64dd",
+    "test/wifi_fallback/WifiFallbackTest.cpp": "6793cd6e79553ae99d6a0fb791d4f4adbc7248cc0bd4ce082e76b4294e380e51",
+    "test/wifi_fallback/README.md": "8394cf1d326b2b1b697cf22c647e46ac449917a46e8da24a604a361a2e681bb6",
+    "test/wifi_fallback/stubs/ObfuscationUtils.h": "437e95d6ec387da9d6bbbfc4ad913d5dbf7ee5d08fce7bbc450cad39e8fec1e5",
+    "test/wifi_fallback/stubs/Logging.h": "cddea1d356d5a3d3d6542a27e540b9d1f39d6227a4bcee36e2c4d4ab49397c47",
+    "test/wifi_fallback/stubs/Arduino.h": "b3adf106d95b8934f690943f2921308b90be5b766c4c8ba250c792de56400201"
+  },
+  "firmwareIncluded": false,
+  "published": false,
+  "device": "NOT_MEASURED"
+}

@@ -1,0 +1,16 @@
+diff --git a/src/main.cpp b/src/main.cpp
+index 65b4aed..6d05ec4 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -410,8 +410,9 @@ static void deliverSleepPluginEvents(const bool allowNetwork) {
+   if (powerManager.getBatteryPercentage() < 20) return;
+   // Sleep can be the first WiFi use since boot or deep-sleep wake.
+   WIFI_STORE.loadFromFile();
+-  const auto cred = WIFI_STORE.findCredential(WIFI_STORE.getLastConnectedSsid());
+-  if (!cred) return;
++  auto cred = WIFI_STORE.findCredential(WIFI_STORE.getLastConnectedSsid());
++  if (!cred || cred->ssid.empty()) cred = WIFI_STORE.getCredentialAt(0);
++  if (!cred || cred->ssid.empty()) return;
+ 
+   GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
+   WiFi.mode(WIFI_STA);
