@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "scope": "TEST_ONLY supplement to P4 TIMED; no shipped code/build configuration change",
+  "p4PublicCommit": "f7dbdb3c673526b15b4732f2fa6e7849452dea29",
+  "cpTree": "22c67de7a62e37a02bf43263bc6413fc95c91336",
+  "sdkTree": "942814decb094f492771ce63aed20161dcd1c7e3",
+  "files": {
+    "LICENSE": "b489ce1358e321a2ba270c4764cd2afbb5347eae44fbe26ea994e4684ab65bf0",
+    "source-inventory.json": "748df5e75ec1d1359f3568586de38d3c37287e97a5cc68741df1a7362bcf4e70",
+    "README.md": "5c19fe2a590cc8e27ada76d37b11cddcb325467498eaf116a366574282b6faf9",
+    "LICENSE-SDK": "17dea5079d9905fbbc8323cde7bfffd0f24185949c43a5daad5177022b796588",
+    "NOTICE-SDK": "05da677948873f09a5d52f449e99af462feed6c4cdaea244f098a6adc5eeb08a",
+    "evidence/negative.log": "bc1292b4311ea2c0bfd344d08519073b6b8b5e751f7daea177036373268716bb",
+    "evidence/host.log": "2bcfa73561dac7f491fec73317ee7ce199e18f01bdc9e297a778fd44bea5c0ba",
+    "test/run.py": "4d078127673230c91e2831ddaa3bd11a11aa8d46a483ac6c948ac7edc5b3fd81",
+    "test/BusyHeadersTest.cpp": "f07b4e930dbd2a5433db66338a64cb5a988ea52a6545e72581ebefa6d40a25fb",
+    "test/README.md": "6e748b06f97cf4547c1563777487991eec6fa3d495cbca9b2615ef2ca629f181",
+    "test/stubs/Client.h": "fdc7a32407bd4ec7f6c25da38892f80b847cf8285decc8f7084903648d086029",
+    "test/stubs/base64.h": "274f5ff9851b58194a60980b2d34def14a380534fc8f95ecafcfbe5914c6b156",
+    "test/stubs/HalStorage.h": "ce70326cd61ca856daf809ca10f35c50e4eb96ef58422c9bad5e904c64b4c0f3",
+    "test/stubs/WString.h": "f39d2631e41a41ea65f71ccc5585f2738b10f647b5864c1daf5d8fc31eeeadf9",
+    "test/stubs/WiFiClient.h": "1071dd8765d2606ec5f1d1c7636e59ad8fe1141de839ec01a31bed6f3147f367",
+    "test/stubs/Arduino.h": "79c842f3198ae98f1ba4915055352e0d0d653e0df49f8755e291878dccd1b144"
+  },
+  "productionChanged": false,
+  "firmwareIncluded": false,
+  "firmwareBuild": "NOT_NEEDED_TEST_ONLY",
+  "tls": "STUBBED",
+  "device": "NOT_MEASURED",
+  "readiness": "HOST_REVIEW_SUPPLEMENT_NOT_RELEASE"
+}

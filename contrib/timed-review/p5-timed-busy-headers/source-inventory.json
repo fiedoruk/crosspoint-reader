@@ -1,0 +1,38 @@
+{
+  "cp_base": "b32f907e5b6bcdaf80dad5b2fb52a3b3ef869802",
+  "cp_full_tree": "22c67de7a62e37a02bf43263bc6413fc95c91336",
+  "cp_gitlink": "6a208c0c46cce99bafa334bc4f171f5e558c5195",
+  "sdk_actual_base": "5f0d52196a770947f7f27f15701c2b1430569697",
+  "sdk_full_tree": "942814decb094f492771ce63aed20161dcd1c7e3",
+  "p4_public_commit": "f7dbdb3c673526b15b4732f2fa6e7849452dea29",
+  "sources_sha256": {
+    "src/util/PluginEvents.cpp": "25de47b879a3339a1a8df8bb8b4783c10816b747c014cc6045875f64e62ab108",
+    "src/util/PluginHttp.cpp": "cbe5cdab1531d03b9cca14bdf9567ebc06958a3e3997c78cf019f94d61951d88",
+    "src/util/PluginEventAsset.cpp": "9bb41e8d5d615fa1a82e0b8fe5c0766f0411f37706619139f8728d04cb2c421d",
+    "src/util/PluginDrainBudget.h": "1d696736fb81d5228f28e915c42806f2da37ecf44269d8de3da940f59ea0222e",
+    "src/util/TimedSleepPaint.cpp": "af0e0271d29f344cfd4d61c08b9c15e077b95058f62d43ea4bdc41c90776abc7",
+    "lib/GfxRenderer/Bitmap.cpp": "79adf22249bf17d1e47a0b49e8629ec79ef2ad94d1f51f4acde6377c298a1155",
+    "lib/GfxRenderer/BitmapHelpers.cpp": "79a2e78c38a4de3a817a42defbd5d46e9e5d93c6da0050e7004bf86cbc9fa0dd",
+    "freeink-sdk/libs/network/SecureNet/include/SecureHttpClient.h": "0f9d502f6c46148a290717f88a48f20346cc6d3d483feadc9679bc5d2906a01e",
+    "freeink-sdk/libs/network/SecureNet/include/SecureClient.h": "200af65277195c36edb2a78022aae68311a6b0fb968bfc086763f56a30ee66f9",
+    "freeink-sdk/libs/network/SecureNet/test/host/stubs/WiFiClient.h": "a21c8ead6e1714f94418224fc6a38ce413acff3cab82b7c13547047d4c2324c7",
+    "test/timed_sync/stubs/HalStorage.h": "76ac4632daac3b1c82fdf7bec7269eb12c3b1920b615e682f9cdb13c95d13bfa",
+    "test/timed_sync/stubs/GfxRenderer.h": "a2134f167e7e1c4e48a587cd5aa4aee11a8ec2786f8ac5f0475dac96115e4c41"
+  },
+  "test_sha256": {
+    "test/BusyHeadersTest.cpp": "f07b4e930dbd2a5433db66338a64cb5a988ea52a6545e72581ebefa6d40a25fb",
+    "test/README.md": "6e748b06f97cf4547c1563777487991eec6fa3d495cbca9b2615ef2ca629f181",
+    "test/run.py": "4d078127673230c91e2831ddaa3bd11a11aa8d46a483ac6c948ac7edc5b3fd81",
+    "test/stubs/Arduino.h": "79c842f3198ae98f1ba4915055352e0d0d653e0df49f8755e291878dccd1b144",
+    "test/stubs/Client.h": "fdc7a32407bd4ec7f6c25da38892f80b847cf8285decc8f7084903648d086029",
+    "test/stubs/HalStorage.h": "ce70326cd61ca856daf809ca10f35c50e4eb96ef58422c9bad5e904c64b4c0f3",
+    "test/stubs/WString.h": "f39d2631e41a41ea65f71ccc5585f2738b10f647b5864c1daf5d8fc31eeeadf9",
+    "test/stubs/WiFiClient.h": "1071dd8765d2606ec5f1d1c7636e59ad8fe1141de839ec01a31bed6f3147f367",
+    "test/stubs/base64.h": "274f5ff9851b58194a60980b2d34def14a380534fc8f95ecafcfbe5914c6b156"
+  },
+  "logs_sha256": {
+    "evidence/host.log": "2bcfa73561dac7f491fec73317ee7ce199e18f01bdc9e297a778fd44bea5c0ba",
+    "evidence/negative.log": "bc1292b4311ea2c0bfd344d08519073b6b8b5e751f7daea177036373268716bb"
+  },
+  "production_changed": false
+}

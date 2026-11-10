@@ -1,0 +1,6 @@
+progress: trigger=4300 poll=4300 post-trigger=0 total=4300
+progress: trigger=4300 poll=4300 post-trigger=0 total=4300
+valid: staged, committed and painted
+abort: trigger=4300 post-trigger=0 unread=1775 requests=1 closed=yes part-absent=yes old-unchanged=yes
+budget: trigger=4300 post-trigger=0 unread=1775 requests=1 closed=yes part-absent=yes old-unchanged=yes
+fresh prepare after each failure: PASS

@@ -1,0 +1,2 @@
+abort: mutation detected by progress oracle (exit -6); progress: trigger=4300 poll=6054 post-trigger=1754 total=6054
+budget: mutation detected by progress oracle (exit -6); progress: trigger=4300 poll=6054 post-trigger=1754 total=6054
