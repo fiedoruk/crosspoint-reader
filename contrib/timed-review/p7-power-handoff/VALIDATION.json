@@ -1,0 +1,73 @@
+{
+  "status": "SOURCE_HOST_BUILD_PASS_DEVICE_PENDING",
+  "source": "current CP0333 + SDK4101 + dependent prerequisites",
+  "host": [
+    {
+      "name": "power",
+      "exit": 0,
+      "pass": true,
+      "wallSeconds": 0.5383735419998175
+    },
+    {
+      "name": "power-negative",
+      "exit": 1,
+      "pass": true,
+      "wallSeconds": 0.5475822079999944
+    },
+    {
+      "name": "timed",
+      "exit": 0,
+      "pass": true,
+      "wallSeconds": 10.619173541999999
+    },
+    {
+      "name": "guard",
+      "exit": 0,
+      "pass": true,
+      "wallSeconds": 0.9973752500000046
+    }
+  ],
+  "p5": "PASS on this base; unchanged affected sources after Power fix",
+  "p6": "exact SecureClient hashes retained, previous real TLS evidence reused",
+  "physicalC3": "NOT_MEASURED",
+  "physicalPower": "NOT_MEASURED",
+  "originalFailure": "verified capture bypassed normal GPIO input initialization; pre-fix verifier-call assertion fails",
+  "reviews": "four axes; one batch of fixes and targeted followup",
+  "scope": "dependent integration, not release",
+  "build": {
+    "target": "x4pro",
+    "status": "PASS",
+    "cpTree": "3dda74557ecc280512b023973000b99bed8a09a7",
+    "sdkTree": "94aa2352c283078bb7b75404bf249bd3beffc56e",
+    "memoryLines": [
+      "RAM:   [===       ]  34.1% (used 111604 bytes from 327680 bytes)",
+      "Flash: [========  ]  83.1% (used 5444742 bytes from 6553600 bytes)"
+    ],
+    "firmware.bin": {
+      "bytes": 5450000,
+      "sha256": "1f91c2b8538ff8b579db35d31600b39c3e2a21d7e72c19f0386a066090815d82"
+    }
+  },
+  "recipient": {
+    "status": "PASS",
+    "sourceReplay": "public pinned refs, exact trees",
+    "checks": [
+      {
+        "name": "power",
+        "exit": 0,
+        "wallSeconds": 0.7104449160001423
+      },
+      {
+        "name": "guard",
+        "exit": 0,
+        "wallSeconds": 0.8586287079999693
+      },
+      {
+        "name": "timed",
+        "exit": 0,
+        "wallSeconds": 11.60368495900002
+      }
+    ],
+    "hardware": "NOT_MEASURED"
+  }
+}
