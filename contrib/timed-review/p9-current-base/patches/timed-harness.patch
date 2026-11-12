@@ -1,0 +1,12 @@
+diff --git a/test/timed_sync/BootIoTest.cpp b/test/timed_sync/BootIoTest.cpp
+index 0215cc9..577b989 100644
+--- a/test/timed_sync/BootIoTest.cpp
++++ b/test/timed_sync/BootIoTest.cpp
+@@ -149,6 +149,7 @@ struct Cred {
+ };
+ struct WifiStore {
+   void loadFromFile() {}
++  std::optional<Cred> getCredentialAt(size_t) { return std::nullopt; }
+   std::string getLastConnectedSsid() { return "fixture"; }
+   std::optional<Cred> findCredential(const std::string&) {
+     return credential ? std::optional<Cred>(Cred{emptySsid ? "" : "fixture", ""}) : std::nullopt;

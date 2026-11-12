@@ -1,0 +1,36 @@
+diff --git a/src/main.cpp b/src/main.cpp
+index 2442d6b..7414ac9 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -416,8 +416,9 @@ static void deliverSleepPluginEvents(const bool allowNetwork) {
+   if (powerManager.getBatteryPercentage() < 20) return;
+   // Sleep can be the first WiFi use since boot or deep-sleep wake.
+   WIFI_STORE.loadFromFile();
+-  const auto cred = WIFI_STORE.findCredential(WIFI_STORE.getLastConnectedSsid());
+-  if (!cred) return;
++  auto cred = WIFI_STORE.findCredential(WIFI_STORE.getLastConnectedSsid());
++  if (!cred || cred->ssid.empty()) cred = WIFI_STORE.getCredentialAt(0);
++  if (!cred || cred->ssid.empty()) return;
+ 
+   GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
+   WiFi.mode(WIFI_STA);
+@@ -634,7 +635,8 @@ static uint64_t prepareTimerPanel() {
+       pluginevents::prepareTimed(BoardConfig::ACTIVE.displayHeight, BoardConfig::ACTIVE.displayWidth);
+   if (!interval) return 0;
+   WIFI_STORE.loadFromFile();
+-  const auto cred = WIFI_STORE.findCredential(WIFI_STORE.getLastConnectedSsid());
++  auto cred = WIFI_STORE.findCredential(WIFI_STORE.getLastConnectedSsid());
++  if (!cred || cred->ssid.empty()) cred = WIFI_STORE.getCredentialAt(0);
+   if (!cred || cred->ssid.empty()) {
+     pluginevents::discardTimed();
+     return 0;
+@@ -667,7 +669,8 @@ static bool syncTimerPanel() {
+   if (preparedTimerSource != timedsource::Source::Plugin) return abort();
+   halClock.begin();
+   trustedtime::init();
+-  const auto cred = WIFI_STORE.findCredential(WIFI_STORE.getLastConnectedSsid());
++  auto cred = WIFI_STORE.findCredential(WIFI_STORE.getLastConnectedSsid());
++  if (!cred || cred->ssid.empty()) cred = WIFI_STORE.getCredentialAt(0);
+   if (!cred || cred->ssid.empty() || abort()) {
+     pluginevents::discardTimed();
+     return manualPower;

@@ -1,0 +1,244 @@
+diff --git a/docs/timed-refresh.md b/docs/timed-refresh.md
+index 16d512d..1397823 100644
+--- a/docs/timed-refresh.md
++++ b/docs/timed-refresh.md
+@@ -50,6 +50,8 @@ The timer wake does not launch a reader activity or write book progress. A
+ captured Power request returns through normal reader wake handling, including
+ the configured click/hold preference. The GPIO path retains pressed and verified
+ states across blocking work; PaperMono uses its PMIC's read-clear button event.
++Normal Power wake processing still initializes GPIO debounced input after a verified
++capture. The captured hold remains valid if the button has already been released.
+ If RTC arming or cancellation fails, verified disabling of the PMIC RTC wake
+ route still permits button-only shutdown. An unknown wake-route state restarts
+ instead of powering off. An unexpected return from shutdown uses the existing recovery path rather than
+diff --git a/src/main.cpp b/src/main.cpp
+index b3c0756..c68e79d 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -793,8 +793,10 @@ void setup() {
+        timerHooks.manualPower);
+   const bool powerWake = wakeupReason == HalGPIO::WakeupReason::PowerButton || manualTimerWake;
+   // The Metalio boots after the button is released, so it skips the check.
++  // Prime debounced input even when TIMED already verified the wake gesture.
++  // Its captured hold remains valid if the button has since been released.
+   const bool wakeHoldVerified =
+-      capturedPowerVerified || !powerWake || BoardConfig::isMetalioEInk4() || gpio.verifyPowerButtonWakeup();
++      !powerWake || BoardConfig::isMetalioEInk4() || gpio.verifyPowerButtonWakeup() || capturedPowerVerified;
+ 
+   // X4 Pro and X4 Classic both map BTN_UP to GPIO0 — an ESP32-S3 boot strap — so
+   // gate recovery on the non-strap Down key (GPIO7) to avoid a stuck-in-recovery loop.
+diff --git a/test/test_remote_button_input.py b/test/test_remote_button_input.py
+index 297072e..bab9550 100644
+--- a/test/test_remote_button_input.py
++++ b/test/test_remote_button_input.py
+@@ -3,6 +3,7 @@
+ from pathlib import Path
+ import subprocess
+ import tempfile
++import sys
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+ source = (ROOT / "src/MappedInputManager.cpp").read_text()
+@@ -24,7 +25,7 @@ stub = r"""
+ #include <cstdint>
+ struct HalGPIO {
+   enum { BTN_BACK, BTN_CONFIRM, BTN_LEFT, BTN_RIGHT, BTN_UP, BTN_DOWN, BTN_POWER };
+-  bool pressed = false, released = false, held = false;
++  bool pressed = false, released = false, held = false, down = false;
+   uint8_t button = 0;
+   unsigned long powerHeldMs = 20;
+   void update() {}
+@@ -32,7 +33,7 @@ struct HalGPIO {
+   bool wasAnyReleased() const { return released; }
+   bool wasPressed(uint8_t b) const { return b == button && pressed; }
+   bool wasReleased(uint8_t b) const { return b == button && released; }
+-  bool isPressed(uint8_t b) const { return b == button && held; }
++  bool isPressed(uint8_t b) const { return (b == BTN_DOWN && down) || (b == button && held); }
+   unsigned long getHeldTime() const { return 900; }
+   unsigned long getPowerButtonHeldTime() const { return powerHeldMs; }
+   bool wasCapacitivePagePressed() const { return false; }
+@@ -176,6 +177,118 @@ picker = (ROOT / "src/activities/reader/EpubReaderFootnoteSelectActivity.cpp").r
+ picker_confirm = "  if ((mappedInput.wasReleased(" + picker.split(
+     "  if ((mappedInput.wasReleased(", 1
+ )[1].split(" {", 1)[0]
++main_source = (ROOT / "src/main.cpp").read_text()
++power_dispatch = main_source.split(
++    "  if (wakePowerReleasePending && !gpio.isPressed(HalGPIO::BTN_POWER)) {", 1
++)[1].split("  const bool x4ProDoubleClickEnabled", 1)[0]
++power_dispatch = "  if (wakePowerReleasePending && !gpio.isPressed(HalGPIO::BTN_POWER)) {" + power_dispatch
++if "--negative-control" in sys.argv:
++    # Remove only the wake-release reset; a compiler error is not a passing mutant.
++    power_dispatch = power_dispatch.replace("    mappedInputManager.resetPowerButtonInput();\n", "", 1)
++harness += r"""
++int sleepCalls = 0, screenshotCalls = 0, activityDispatches = 0;
++void enterDeepSleep() { ++sleepCalls; }
++struct ScreenshotUtil { static void takeScreenshot(GfxRenderer&) { ++screenshotCalls; } };
++void dispatchPower(MappedInputManager& mappedInputManager, HalGPIO& gpio,
++                   GfxRenderer& renderer, bool& wakePowerReleasePending) {
++POWER_DISPATCH
++  ++activityDispatches;
++}
++
++void checkWakeAndScreenshot() {
++  for (bool x4Pro : {false, true}) {
++    BoardConfig::x4Pro = x4Pro;
++    for (int action : {CrossPointSettings::PAGE_TURN, CrossPointSettings::SLEEP,
++                       CrossPointSettings::PWR_CONFIRM}) {
++      SETTINGS.shortPwrBtn = action;
++      SETTINGS.doublePwrBtn = CrossPointSettings::PWR_FRONTLIGHT;
++      HalGPIO gpio;
++      GfxRenderer renderer;
++      MappedInputManager input(gpio, renderer);
++      gpio.button = HalGPIO::BTN_POWER;
++      bool wakePending = true;
++      clockMs = 10000;
++      gpio.held = true;
++      input.update();
++      dispatchPower(input, gpio, renderer, wakePending);
++      assert(wakePending && !input.powerSleepClick());
++      gpio.held = false;
++      gpio.released = true;
++      input.update();
++      const int before = activityDispatches;
++      const int sleepBefore = sleepCalls;
++      dispatchPower(input, gpio, renderer, wakePending);
++      assert(!wakePending && activityDispatches == before);
++      gpio.released = false;
++      clockMs += 501;
++      input.update();
++      assert(input.homeButtonAction() == HomeButtonAction::Ignore && "wake release leaked");
++      assert(!input.powerSleepClick() && "wake release leaked");
++      dispatchPower(input, gpio, renderer, wakePending);
++      assert(activityDispatches == before + 1 && sleepCalls == sleepBefore);
++
++      // A screenshot owns both the held frame and its final Power release.
++      gpio.held = true;
++      gpio.down = true;
++      input.update();
++      const int shots = screenshotCalls;
++      const int beforeScreenshot = activityDispatches;
++      dispatchPower(input, gpio, renderer, wakePending);
++      dispatchPower(input, gpio, renderer, wakePending);
++      assert(screenshotCalls == shots + 1);
++      assert(activityDispatches == beforeScreenshot);
++      gpio.held = false;
++      gpio.down = false;
++      gpio.released = true;
++      input.update();
++      dispatchPower(input, gpio, renderer, wakePending);
++      assert(activityDispatches == beforeScreenshot);
++      gpio.released = false;
++      clockMs += 501;
++      input.update();
++      assert(input.homeButtonAction() == HomeButtonAction::Ignore);
++      assert(!input.powerSleepClick());
++      dispatchPower(input, gpio, renderer, wakePending);
++      assert(sleepCalls == sleepBefore && activityDispatches == beforeScreenshot + 1);
++      // The same input instance must still accept the next real gesture.
++      gpio.released = true;
++      clockMs += 1000;
++      input.update();
++      gpio.released = false;
++      clockMs += 501;
++      input.update();
++      if (x4Pro) {
++        assert(input.powerSleepClick() == (action == CrossPointSettings::SLEEP));
++        if (action == CrossPointSettings::PAGE_TURN) assert(input.homeButtonAction() == HomeButtonAction::NextPage);
++        if (action == CrossPointSettings::PWR_CONFIRM) assert(input.homeButtonAction() == HomeButtonAction::Confirm);
++        gpio.released = true;
++        clockMs += 1000;
++        input.update();
++        clockMs += 100;
++        input.update();
++        assert(input.homeButtonAction() == HomeButtonAction::ToggleFrontlight);
++      }
++    }
++  }
++  // Reset must also discard a Sleep action deferred by an input update during rendering.
++  BoardConfig::x4Pro = true;
++  SETTINGS.shortPwrBtn = CrossPointSettings::SLEEP;
++  HalGPIO gpio;
++  GfxRenderer renderer;
++  MappedInputManager input(gpio, renderer);
++  gpio.button = HalGPIO::BTN_POWER;
++  clockMs = 20000;
++  gpio.released = true;
++  input.update(true);
++  gpio.released = false;
++  clockMs += 501;
++  input.update(true);
++  bool wakePending = true;
++  dispatchPower(input, gpio, renderer, wakePending);
++  input.update();
++  assert(!input.powerSleepClick());
++}
++""".replace("POWER_DISPATCH", power_dispatch)
+ harness += r"""
+ #include <vector>
+ bool pickerConfirms(const MappedInputManager& mappedInput) {
+@@ -249,6 +362,7 @@ int main() {
+     checkRemoteButtons();
+   }
+   checkPowerClicks();
++  checkWakeAndScreenshot();
+ }
+ """
+ harness = harness.replace("PICKER_CONFIRM_CONDITION", picker_confirm)
+@@ -258,8 +372,9 @@ with tempfile.TemporaryDirectory() as directory:
+     cpp = directory / "remote_input.cpp"
+     executable = directory / "remote_input"
+     cpp.write_text("#include <initializer_list>\n" + harness)
++    sanitize = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"] if "--sanitize" in sys.argv else []
+     subprocess.run([
+-        "c++", "-std=c++20", "-DFREEINK_CAP_TOUCH=0", "-I", str(directory),
++        "c++", "-std=c++20", *sanitize, "-DFREEINK_CAP_TOUCH=0", "-I", str(directory),
+         "-I", str(ROOT / "src"), str(cpp), "-o", str(executable),
+     ], check=True)
+     subprocess.run([str(executable)], check=True)
+diff --git a/test/timed_sync/BootIoTest.cpp b/test/timed_sync/BootIoTest.cpp
+index 577b989..71c57a8 100644
+--- a/test/timed_sync/BootIoTest.cpp
++++ b/test/timed_sync/BootIoTest.cpp
+@@ -272,6 +272,16 @@ static void testWakeHold() {
+     assert(verifyWakeHold(c.reason, c.resumed) == c.accepted);
+     assert(gpio.wakeHoldChecks == c.checks);
+   }
++  BoardConfig::metalio = false;
++  for (const auto reason : {R::PowerButton, R::Timer, R::RtcTimer, R::Other}) {
++    for (const bool held : {false, true}) {
++      gpio.wakeHeld = held;
++      gpio.wakeHoldChecks = 0;
++      timerHooks.manualPower = reason == R::Timer || reason == R::RtcTimer;
++      assert(verifyWakeHold(reason, reason == R::Other, true));
++      assert(gpio.wakeHoldChecks == 1 && "captured wake skipped input initialization");
++    }
++  }
+ }
+ static bool runSync() {
+   gpio.beginPowerWakeCapture();
+@@ -389,7 +399,7 @@ int main() {
+   assert(prepareTimerPanel() == 0 && !pluginevents::prepared && WiFi.begins == 0);
+   reset();
+   assert(verifyWakeHold(wakeup::Reason::PowerButton, true, true));
+-  assert(gpio.wakeHoldChecks == 0);
++  assert(gpio.wakeHoldChecks == 1);
+   reset();
+   SETTINGS.pluginsEnabled = 0;
+   assert(timerHooks.prepare() == 0);
+diff --git a/test/timed_sync/run.py b/test/timed_sync/run.py
+index 0cf0b6a..8485ca3 100644
+--- a/test/timed_sync/run.py
++++ b/test/timed_sync/run.py
+@@ -112,3 +112,12 @@ assert 'gpio.powerWakeRequest()' in narrow
+ assert 'SETTINGS.loadFromFile(' not in narrow
+ assert setup.index('SETTINGS.loadTimerSettings()') < setup.index('timedwake::handleBoot(') < setup.index('SETTINGS.loadFromFile()')
+ assert 'timerMinimumBatteryPercent()' in setup
++
++# The accepted Power/timer route seeds the release guard before foreground input.
++accepted = setup[setup.index('switch (wakeupReason)'):setup.index('case HalGPIO::WakeupReason::AfterUSBPower:')]
++assert 'wakePowerReleasePending = true;' in accepted
++assert 'case HalGPIO::WakeupReason::PowerButton:' in accepted
++assert 'case HalGPIO::WakeupReason::Timer:' in accepted
++assert 'case HalGPIO::WakeupReason::RtcTimer:' in accepted
++loop = main[main.index('void loop() {'):]
++assert loop.index('mappedInputManager.update();') < loop.index('if (wakePowerReleasePending')

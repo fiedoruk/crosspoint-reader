@@ -1,0 +1,52 @@
+{
+  "cp": "fa17b9ca794c798d925734af9cce2bc3bff644ec",
+  "sdk": "e637713a533ea7583ba73fa2052967c21cf0335d",
+  "timer": "a38095cf3f73402456538c1893142061c72a4c31",
+  "cpGitlinkUnchanged": "6a208c0c46cce99bafa334bc4f171f5e558c5195",
+  "sdkTree": "e9bae41825fc22fdce39afbc41423b7df4aa88ae",
+  "cpPatches": [
+    "01-checked-bmp.patch",
+    "02-bounded-events.patch",
+    "03-verified-events.patch",
+    "04-timer-prerequisite.patch",
+    "05-timed-source.patch",
+    "timed-3867.patch",
+    "timed-harness.patch",
+    "p1-tests-and-docs.patch",
+    "p7-power-handoff.patch"
+  ],
+  "sdkPatches": [
+    "sdk-future-verified.patch",
+    "p6-retry.patch"
+  ],
+  "files": {
+    "LICENSE": "b489ce1358e321a2ba270c4764cd2afbb5347eae44fbe26ea994e4684ab65bf0",
+    "LICENSE-SDK": "17dea5079d9905fbbc8323cde7bfffd0f24185949c43a5daad5177022b796588",
+    "NOTICE-SDK": "05da677948873f09a5d52f449e99af462feed6c4cdaea244f098a6adc5eeb08a",
+    "README.en.md": "c44fcd3467bb574ece6bacf0e0ead4c7f02cf63938c60566cf9aa1f64af51055",
+    "VALIDATION.json": "a38a754546cf9731877d1144c28e7e8e3d856e3196c78e2d1ca7e3585035ecf7",
+    "patches/01-checked-bmp.patch": "b251f6e7391096d118c228a8ad44eb0eee1c698790b3179392dedc9e03404421",
+    "patches/02-bounded-events.patch": "c23fe6b60aa84f651b0b87a443adbd00986f3c4621c26f717bfdeed73bac9c0f",
+    "patches/03-verified-events.patch": "2bd3e1ef7ffcc0ec746b65f9717957373a025e36d9a94973adf4a71073b01627",
+    "patches/04-timer-prerequisite.patch": "59d0339af0421eeeef8d5e811bf443ef1265cea29c97cae2f2e116d8b42ced68",
+    "patches/05-timed-source.patch": "8c93c8a312bab30f77016b8607dcc4a344c1854dca031df1295afec3f60e23ba",
+    "patches/p1-tests-and-docs.patch": "115b2929dcf2631772e873fd13909c02bcd90c33d8868c74049f1a54b3935ea0",
+    "patches/p6-retry.patch": "aae8571652e11240a2e7d5ae417d8c0fd4e0ea39bf800f54ad789eff8af272c0",
+    "patches/p7-power-handoff.patch": "1c606c7446bbaa48ede1752352d880e89e850709cd053be69506ec689f084217",
+    "patches/sdk-future-verified.patch": "761925ed7df7da90e1b82d35458c2230214cc481125c9ce72c8f1018a5b9ddb5",
+    "patches/timed-3867.patch": "56ba385be37a3feccdf54e72aca3cd9b4aa2e3cf472f336d2e11a21380a302b8",
+    "patches/timed-harness.patch": "aa2daee7294770aa5a617a7c37403bff479a9359a8a659c23effbc3f58e91294",
+    "replay.py": "114fc0c9300a683a78a12dc6256e91542e5900c64337f710a7d94ceaac7fa8ac",
+    "test/parser/CMakeLists.txt": "5bdbf577aa1613037c39de36ecb74053482a208d2e2116190cf3979846cf4461",
+    "test/reflow.cpp": "e2c74cc559abff5c23f5eeedb30ca05d0966dc568492e35596932178f4aad39e",
+    "test/reflow.py": "f26c86dd37a259ff52bada989d793e37c10faac8c3ea5060fd5e5930093ef5c8",
+    "test/screenshot.cpp": "0105373c55d8c89bbefa1ebff43f7e2819a92d727873a04f267af8f8043fc6e0",
+    "test/screenshot.py": "dbb523b6becf9d41167d3209c7180e199570c537e02457c6ec6d878c0e389f55",
+    "test/settings.py": "c53b9a937f2be34f4b4ee33f88953955aab690f7a33672d8173ffd2509a2474b"
+  },
+  "cpTrees": {
+    "w06": "e83310d0e688131e0b3a081eae71ac72e1aa4047",
+    "timed": "4dffa2760a7b312c825bf99d61b17d7259f5c088"
+  },
+  "w06LastPatch": "03-verified-events.patch"
+}

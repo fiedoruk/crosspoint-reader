@@ -1,0 +1,33 @@
+{
+  "cp": "fa17b9ca794c798d925734af9cce2bc3bff644ec",
+  "sdkQualification": "e637713a533ea7583ba73fa2052967c21cf0335d",
+  "officialCpSdkPin": "6a208c0c46cce99bafa334bc4f171f5e558c5195",
+  "productionDeltaFromP7": "NONE",
+  "host": {
+    "w06": "verified HTTP/event trust nine modes/cases, budget and SDK suite PASS",
+    "timed": "Power, guard, TIMED three SDK modes and paint, P5 busy headers PASS",
+    "settings": "actual selected timer visitor plus ShowFileExtensions PASS",
+    "reflow": "progress read + cache version/viewport rejection + margin + normal/deferred offset mapper PASS; synthetic rebuilt LUT",
+    "negativeControl": "compiled, expected normal resume lost text anchor assertion",
+    "screenshot": "production draw/screenshot round-trip four orientations, actual800x480 and synthetic17x9 stride PASS",
+    "parser": "upstream ChapterHtmlSlimParserTest130/130 PASS, isolated CMake target",
+    "asset": "W04-only stage PASS; old asset runner is not compatible with overloaded W06 drain; combined callers checked separately",
+    "p6RealWolfssl": "prior HOST evidence reused after source hash parity; no new run"
+  },
+  "build": {
+    "target": "x4pro",
+    "status": "PASS",
+    "scope": "full TIMED qualification lane only; no separate W06 or official-pin build",
+    "firmwareSha256": "5bdcd03a99caef244a47529c0411fdd4a7713dda80dd699eeb6c1a6aab3e7111",
+    "binBytes": 5451344,
+    "core": "pioarduino55.03.311 existing USB-compatible core",
+    "psramBrownoutElfGate": "PASS_BUILD_ONLY"
+  },
+  "device": "NOT_MEASURED; P8 remains historical P7-only scoped evidence",
+  "limits": [
+    "full font/layout-to-resume composition not executed",
+    "production cache-hit fast path not executed by reflow fixture",
+    "no C3 memory measurement",
+    "no official release qualification"
+  ]
+}
