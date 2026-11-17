@@ -1,0 +1,26 @@
+{
+  "build": {
+    "target": "x4pro",
+    "sha256": "6be4434d58c7231614413720660bb88dc3e834abbc9a6a1ac36722853b7c105d",
+    "linkedStartup": "PSRAM and BOD symbols present",
+    "scope": "full TIMED integration"
+  },
+  "host": [
+    "upstream Power touch 0/1",
+    "SDK/CP TLS P6 real wolfSSL with baseline and adapted client",
+    "P5 event budget and cancellation",
+    "W06 verified HTTP and event trust",
+    "ordinary sleep success / retry / refusal",
+    "timed storage refusal / captured Power",
+    "Local SD decode failures and monochrome fallback",
+    "Plugin staged BMP and last-good",
+    "TIMED boot, button capture, PMIC and USB cold boot"
+  ],
+  "qualificationLimits": [
+    "no physical P10 measurement",
+    "test renderer for gray transfer; no actual waveform or panel QA",
+    "SD fault injection only",
+    "no C3 heap or energy measurements",
+    "P8 results are on an older binary"
+  ]
+}
